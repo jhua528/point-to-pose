@@ -4,7 +4,7 @@ realsense:
     # rs_serial: 941322070969
 
     depth_source: realsense
-    foundation_stereo_model_dir: /home/smkim/workspace/code/point-to-pose/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+    foundation_stereo_model_dir: /home/jinyi/workspace/point-to-pose/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
     foundation_stereo_valid_iters: 4
     foundation_stereo_hiera: false
 
@@ -37,18 +37,18 @@ pipeline:
     map_growth_max_mean_residual: 0.01
 
     debug_level: 1
-    debug_dir: /home/smkim/workspace/code/point-to-pose/debug/model_tracking_export_test
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/model_tracking_export_test
 
 # ---- Offline model map, pointed at reconstruct.py's freshly-trained checkpoint ----
 model_tracking:
   params:
     renderer: gsplat
-    gsplat_path: /home/smkim/workspace/code/point-to-pose/debug/export_test/gaussians.pt
+    gsplat_path: /home/jinyi/workspace/point-to-pose/debug/export_test/gaussians.pt
     gsplat_model: 2dgs
     gsplat_sh_degree: null
     gsplat_depth_mode: median
 
-    map_path: /home/smkim/workspace/code/point-to-pose/debug/model_tracking_export_test/map.pkl
+    map_path: /home/jinyi/workspace/point-to-pose/debug/model_tracking_export_test/map.pkl
     rebuild_map: true
     mesh_scale: 1.0
 
@@ -61,7 +61,7 @@ model_tracking:
     render_radius: 0.2
     debug_save_views: true
 
-    envmap_path: /home/smkim/workspace/code/point-to-pose/assets/envmaps/wooden_lounge_1k.hdr
+    envmap_path: /home/jinyi/workspace/point-to-pose/assets/envmaps/wooden_lounge_1k.hdr
     envmap_intensity: 1.0
     envmap_cube_res: 256
     envmap_ambient_term: 0.5
@@ -91,7 +91,7 @@ tracker:
     resize_height: 256
     resize_width: 256
     device: cuda
-    checkpoint_path: /home/smkim/workspace/code/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
+    checkpoint_path: /home/jinyi/workspace/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
     num_pips_iter: 1
 
 sampler:
@@ -116,14 +116,14 @@ sampler:
     super_point_max_num_keypoints: 512
 
     debug_level: 2
-    debug_dir: /home/smkim/workspace/code/point-to-pose/debug/sampler
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/sampler
     debug_save_superpoint: false
 
 segmenter:
   type: sam2
   params:
     model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
-    checkpoint: /home/smkim/workspace/code/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
+    checkpoint: /home/jinyi/workspace/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
     device: cuda
     single_object: true
 
@@ -132,4 +132,4 @@ visualization:
     visualize_points: true
     points_vis_method: visible
     save_images: false
-    output_image_dir: /home/smkim/workspace/code/point-to-pose/debug/model_tracking_export_test/output_images
+    output_image_dir: /home/jinyi/workspace/point-to-pose/debug/model_tracking_export_test/output_images

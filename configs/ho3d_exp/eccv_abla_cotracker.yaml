@@ -92,17 +92,17 @@ pipeline:
     use_local_graph: false
 
     debug_level: 0
-    debug_dir: /home/justin/code/point-to-pose/debug/
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/
     save_pose: true
-    pose_save_path: /home/justin/code/point-to-pose/debug/poses
+    pose_save_path: /home/jinyi/workspace/point-to-pose/debug/poses
     save_key_points: false
-    key_points_save_path: /home/justin/code/point-to-pose/debug/key_points
+    key_points_save_path: /home/jinyi/workspace/point-to-pose/debug/key_points
     save_meta_data: true
     meta_data_log_every: 5
     meta_data_max_rows: -1
-    meta_data_save_path: /home/justin/code/point-to-pose/debug/pipeline/meta_data
+    meta_data_save_path: /home/jinyi/workspace/point-to-pose/debug/pipeline/meta_data
     save_cropped_pcd: false
-    cropped_pcd_dir: /home/justin/code/point-to-pose/debug/cropped_pcd
+    cropped_pcd_dir: /home/jinyi/workspace/point-to-pose/debug/cropped_pcd
     sdf_mesh_save_every: 0
 
 reconstructor:
@@ -281,13 +281,13 @@ dense_register:
     max_iterations: 30
     epsilon: 1e-6
     debug_level: 0
-    debug_dir: /home/justin/code/point-to-pose/debug/dense_register
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/dense_register
 
 segmenter:
   type: sam2
   params:
     model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
-    checkpoint: /home/justin/code/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
+    checkpoint: /home/jinyi/workspace/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
     device: cuda
 
 # tracker:
@@ -297,7 +297,7 @@ segmenter:
 #     resize_width: 480
 #     visible_threshold: 0.5
 #     device: cuda
-#     checkpoint_path: /home/justin/code/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
+#     checkpoint_path: /home/jinyi/workspace/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
  
   
 tracker:
@@ -344,7 +344,7 @@ sampler:
     sample_max_per_obj: 0              # 0 = no cap
 
     debug_level: 0
-    debug_dir: /home/justin/code/point-to-pose/debug/sampler
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/sampler
     debug_save_superpoint: false
 
 criterion:
@@ -379,7 +379,7 @@ criterion:
     fit_mode: convex
     ratio_threshold: 0.6
     debug_viz: false
-    debug_dir: /home/justin/code/point-to-pose/debug/criterion
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/criterion
 
 local_optimizer:
   type: lm_graph
@@ -417,4 +417,4 @@ visualization:
     # uncertainty, visible, visible_valid, visible_uncertainty, registration_used_valid, registration_correspondence, frame_id
     points_vis_method: visible_uncertainty
     save_images: True
-    output_image_dir: /home/justin/code/point-to-pose/debug/output_images
+    output_image_dir: /home/jinyi/workspace/point-to-pose/debug/output_images

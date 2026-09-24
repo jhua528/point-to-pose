@@ -7,7 +7,7 @@ pipeline:
     estimate_init_pose: true
     frame_to_map_reg: true
     debug_level: 2
-    debug_dir: /home/justin/code/point-to-pose/debug/
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/
 
 
 register:
@@ -17,7 +17,7 @@ segmenter:
   type: sam2
   params:
     model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
-    checkpoint: /home/justin/code/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
+    checkpoint: /home/jinyi/workspace/point-to-pose/checkpoints/sam2.1/sam2.1_hiera_large.pt
     device: cuda
 
 tracker:
@@ -26,14 +26,14 @@ tracker:
     resize_height: 256
     resize_width: 256
     device: cuda
-    checkpoint_path: /home/justin/code/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
+    checkpoint_path: /home/jinyi/workspace/point-to-pose/checkpoints/tapir/causal_bootstapir_checkpoint.pt
 
 sampler: 
   type: random
   params:
     num_points: 30
     debug_level: 2
-    debug_dir: /home/justin/code/point-to-pose/debug/sampler
+    debug_dir: /home/jinyi/workspace/point-to-pose/debug/sampler
 
 criterion:
   type: iteration

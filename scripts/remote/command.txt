@@ -1,0 +1,9 @@
+conda activate point2pose
+cd ~/workspace/point-to-pose
+python scripts/remote/pose_server.py -b tcp://0.0.0.0:5555
+
+
+pkill -f pose_server.py
+
+
+pgrep -af pose_server.py
