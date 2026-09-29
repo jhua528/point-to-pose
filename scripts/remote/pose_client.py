@@ -14,10 +14,23 @@ import numpy as np
 import rclpy
 import zmq
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseArray, Pose
+from geometry_msgs.msg import Point, Pose, PoseArray
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
+from visualization_msgs.msg import Marker, MarkerArray
+
+# Box edges as corner-index pairs; the server orders corners so bit 0/1/2 of the
+# index flips x/y/z, hence edges join indices that differ in exactly one bit.
+BOX_EDGES = [(i, i | 1 << k) for i in range(8) for k in range(3) if not i >> k & 1]
+
+
+def matrix_to_pose(T):
+    p = Pose()
+    p.position.x, p.position.y, p.position.z = T[:3, 3]
+    q = Rotation.from_matrix(T[:3, :3]).as_quat()
+    p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = q
+    return p
 
 
 class PoseClient(Node):
@@ -43,6 +56,7 @@ class PoseClient(Node):
         sync.registerCallback(self.on_frame)
 
         self.pub = self.create_publisher(PoseArray, "/point2pose/poses", 10)
+        self.bbox_pub = self.create_publisher(MarkerArray, "/point2pose/bboxes", 10)
 
     def on_info(self, msg):
         if self.K is None:
@@ -110,17 +124,39 @@ class PoseClient(Node):
         poses = np.asarray(reply["poses"], dtype=np.float64)
         out = PoseArray()
         out.header = rgb_msg.header
-        for T in poses:
-            p = Pose()
-            p.position.x, p.position.y, p.position.z = T[:3, 3]
-            q = Rotation.from_matrix(T[:3, :3]).as_quat()
-            p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w = q
-            out.poses.append(p)
+        out.poses = [matrix_to_pose(T) for T in poses]
         self.pub.publish(out)
+        self.bbox_pub.publish(self.bbox_markers(reply, rgb_msg.header))
         self.get_logger().info(
             f"frame {reply['frame_id']} latency={reply['latency_ms']}ms lost={reply['lost']}",
             throttle_duration_sec=2.0,
         )
+
+    def bbox_markers(self, reply, header):
+        """One wireframe per object in the camera frame; red while the object is lost."""
+        markers = MarkerArray()
+        bboxes = reply.get("bboxes") or []
+        for obj_id, (bbox, lost) in enumerate(zip(bboxes, reply["lost"])):
+            m = Marker()
+            m.header = header
+            m.ns = "point2pose_bbox"
+            m.id = obj_id
+            if bbox is None:
+                m.action = Marker.DELETE
+                markers.markers.append(m)
+                continue
+            m.type = Marker.LINE_LIST
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = 0.005
+            m.color.r, m.color.g, m.color.b = (1.0, 0.2, 0.2) if lost else (0.2, 1.0, 0.2)
+            m.color.a = 1.0
+            corners = bbox["corners"]
+            for a, b in BOX_EDGES:
+                m.points.append(Point(x=corners[a][0], y=corners[a][1], z=corners[a][2]))
+                m.points.append(Point(x=corners[b][0], y=corners[b][1], z=corners[b][2]))
+            markers.markers.append(m)
+        return markers
 
 
 def main():
