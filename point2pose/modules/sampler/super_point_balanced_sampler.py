@@ -48,6 +48,20 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
         self.avoid_existing_points = bool(config.get("avoid_existing_points", True))
 
     def sample(self, context: SamplerContext, obj_id: int):
+        # Thin objects (narrower than ~2x the margin) erode to nothing, so retry
+        # with a halved margin, down to the raw mask, before giving up.
+        margin = self.boundary_margin
+        while True:
+            pts = self._sample_with_margin(context, obj_id, margin)
+            if pts.shape[0] > 0 or margin <= 0:
+                return pts
+            margin //= 2
+            if getattr(self, "debug_level", 0) >= 1:
+                print(
+                    f"[SuperPoint Balanced] Retrying obj {obj_id} with edge margin {margin}px"
+                )
+
+    def _sample_with_margin(self, context: SamplerContext, obj_id: int, margin: int):
         frame = context.frame
         rgb = frame.rgb
         H, W = rgb.shape[:2]
@@ -57,8 +71,8 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
         mask_u8 = (mask_t > 0).to(torch.uint8).mul_(255).cpu().numpy()
 
         # --- 2) Boundary margin erosion
-        if self.boundary_margin > 0:
-            ksz = 2 * self.boundary_margin + 1
+        if margin > 0:
+            ksz = 2 * margin + 1
             kernel_rect = cv.getStructuringElement(cv.MORPH_RECT, (ksz, ksz))
             mask_inner = cv.erode(mask_u8, kernel_rect, iterations=1)
         else:

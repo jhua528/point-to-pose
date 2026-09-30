@@ -250,7 +250,7 @@ class KeyFrameManager:
             obj = objects[obj_id]
 
             # Use track_table mapping to pull this object's initial points
-            track_ids = np.asarray(track_table.obj2track_map[obj_id], dtype=np.int64)
+            track_ids = np.asarray(track_table.obj2track_map.get(obj_id, []), dtype=np.int64)
             if track_ids.size == 0:
                 self.is_key_frame[obj_id] = False
                 continue
@@ -701,7 +701,7 @@ class KeyFrameManager:
         For now, we take all points belonging to this object in the track_table.
         """
         # obj_track_ids list the indices of the points belonging to the object in the track_table
-        obj_track_ids = np.asarray(track_table.obj2track_map[obj_id], dtype=np.int64)
+        obj_track_ids = np.asarray(track_table.obj2track_map.get(obj_id, []), dtype=np.int64)
 
         # if no points belonging to the object, return empty dict
         if obj_track_ids.size == 0:
