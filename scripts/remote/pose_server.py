@@ -248,6 +248,11 @@ def fit_box(mask, metres, K, rng=None, view=None):
 #   * open: the camera sees that far or further. It must see the object, in
 #     the mask and at the mesh point's depth. Seeing past it -- the bench
 #     behind where the mesh says the part is -- counts against the pose.
+#     Outside the mask, a surface at the mesh point's depth and off the
+#     support does not: it is the part where the mask stops short of an
+#     occluder touching it (a gripper finger pressing on it), or that
+#     occluder. It counts as hidden. The bare support there still counts
+#     against the pose: it is how a thin part's too-big mesh shows.
 #   * below the support surface counts against it too. A box tilted over the
 #     part's hidden side shows itself that way, or as open points in the air.
 #
@@ -530,12 +535,22 @@ class _ModelFit:
 
         # Visible mesh points against what the camera sees there.
         idx, u, v, d = self.lines_of_sight(P, seen)
-        open_ = (d > 0) & (d >= P[idx, 2] - MODEL_HIDDEN_M)
-        out["hidden"] = float(np.sum((d > 0) & ~open_)) / max(1, int(np.sum(d > 0)))
-        idx, u, v, d = idx[open_], u[open_], v[open_], d[open_]
         in_mask = self.grown[v, u]
+        open_ = (d > 0) & (d >= P[idx, 2] - MODEL_HIDDEN_M)
+        # Outside the mask, off the support and no further than the mesh
+        # point: hidden too.
+        unmasked = np.zeros(len(idx), bool)
+        if self.plane is not None:
+            n, p0 = self.plane
+            unmasked = (open_ & ~in_mask & (d <= P[idx, 2] + MODEL_TOL_M)
+                        & ((self.cam[v, u] - p0) @ n < -PLANE_TOL_M))
+        with_depth = max(1, int(np.sum(d > 0)))
+        out["hidden"] = float(np.sum(((d > 0) & ~open_) | unmasked)) / with_depth
+        out["unmasked"] = float(np.sum(unmasked)) / with_depth
+        open_ &= ~unmasked
+        idx, u, v, d, in_mask = idx[open_], u[open_], v[open_], d[open_], in_mask[open_]
         # In the mask: paired with the surface seen along the same ray. Outside
-        # it: the camera sees something else there, so pull it to the object.
+        # it: the camera sees past the mesh point, so pull it to the object.
         target = self.cam[v, u]
         if (~in_mask).any():
             target[~in_mask] = self.obs[self.obs_tree.query(P[idx[~in_mask]])[1]]
@@ -714,8 +729,10 @@ class _ModelFit:
                             R, t, terms = R1, t1, t1_terms
                     note = f"measured {measured:.3f}, kept 1"
                 elif ts_terms["cost"] < terms["cost"] - MODEL_SCALE_MIN_GAIN:
+                    at_one = terms
                     R, t, terms, scale = self.polish(measured, Rs, ts, ts_terms, free_scale=True)
-                    note = "measured"
+                    note = (f"measured; at 1: fitness {at_one['fitness']:.2f}, "
+                            f"contradiction {at_one['contradiction']:.2f}")
                 else:
                     note = f"measured {measured:.3f}, too little gain to apply"
             terms["scale_note"] = note
@@ -787,7 +804,8 @@ def fit_model_box(model, view, K, rng=None):
         return None, "no pose left any mesh point in view"
     terms, R, t, scale = result
     stats = (f"fitness {terms['fitness']:.2f}, contradiction {terms['contradiction']:.2f}, "
-             f"penetration {terms['penetration']:.2f}, {terms['hidden']:.0%} hidden, "
+             f"penetration {terms['penetration']:.2f}, {terms['hidden']:.0%} hidden "
+             f"({terms['unmasked']:.0%} outside the mask at the mesh's depth), "
              f"p95 distance {terms['p95_distance'] * 1000:.1f} mm, "
              f"scale {scale:.3f} ({terms['scale_note']}), {fit.observation_note}")
     rejection = model_pose_rejection(terms)
