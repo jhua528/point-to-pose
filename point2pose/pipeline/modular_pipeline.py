@@ -153,6 +153,18 @@ class ModularPipeline:
             return None
         return preview_fn(image, objects_points, objects_labels)
 
+    def propose_masks(self, image):
+        """
+        Class-agnostic mask proposals ([H, W] bool each) for `image`, for locating
+        an object without a click. None if the segmenter offers none.
+        """
+        if not self.frontend.use_segmenter:
+            return None
+        propose_fn = getattr(self.frontend.segmenter, "propose", None)
+        if propose_fn is None:
+            return None
+        return propose_fn(image)
+
     def initialize_first_frame(self, frame):
 
         # TODO: make this a class

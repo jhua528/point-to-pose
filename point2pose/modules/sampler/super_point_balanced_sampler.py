@@ -50,16 +50,74 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
     def sample(self, context: SamplerContext, obj_id: int):
         # Thin objects (narrower than ~2x the margin) erode to nothing, so retry
         # with a halved margin, down to the raw mask, before giving up.
+        # Too few points is retried the same way: a thin part's corners, often its
+        # only features, are what the margin erodes away.
         margin = self.boundary_margin
+        best = np.empty((0, 2), dtype=np.int32)
         while True:
             pts = self._sample_with_margin(context, obj_id, margin)
-            if pts.shape[0] > 0 or margin <= 0:
-                return pts
+            if pts.shape[0] > best.shape[0]:
+                best = pts
+            if best.shape[0] >= self.min_points or margin <= 0:
+                break
             margin //= 2
             if getattr(self, "debug_level", 0) >= 1:
                 print(
                     f"[SuperPoint Balanced] Retrying obj {obj_id} with edge margin {margin}px"
                 )
+        if best.shape[0] < self.min_points:
+            best = self._fill_with_corners(context, obj_id, best)
+        return best
+
+    def _fill_with_corners(self, context: SamplerContext, obj_id: int, pts):
+        """
+        Top up a textureless object's points with Shi-Tomasi corners of its
+        silhouette (a plain plate's corners against the table), spread by
+        farthest-point sampling, up to num_points. SuperPoint finds nothing inside
+        a uniform surface, and the few points it does find cluster at one end,
+        which leaves registration degenerate.
+        """
+        frame = context.frame
+        mask = (frame.mask[obj_id, 0] > 0).cpu().numpy().astype(np.uint8)
+        rgb = np.asarray(frame.rgb)
+        gray = cv.cvtColor(rgb, cv.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
+        corners = cv.goodFeaturesToTrack(
+            gray,
+            maxCorners=4 * self.num_points,
+            qualityLevel=0.01,
+            minDistance=max(self.min_separation_px, 3.0),
+            mask=mask,
+        )
+        if corners is None:
+            return pts
+        cand = np.round(corners.reshape(-1, 2)).astype(np.int32)
+        depth = getattr(frame, "depth", None)
+        if depth is not None:
+            depth = depth.detach().cpu().numpy() if torch.is_tensor(depth) else np.asarray(depth)
+            d = depth[cand[:, 1], cand[:, 0]]
+            cand = cand[np.isfinite(d) & (d > 0)]
+        chosen = [p for p in pts.astype(np.int32)]
+        # Points already tracked on this object count for spacing, not for output.
+        existing = self._collect_existing_points_local(context, obj_id, mask, False, 0, 0)
+        spread = chosen + [p for p in existing]
+        cand = [
+            c for c in cand
+            if all(np.linalg.norm(c - p) >= self.min_separation_px for p in spread)
+        ]
+        while cand and len(chosen) < self.num_points:
+            if spread:
+                far = [min(np.linalg.norm(c - p) for p in spread) for c in cand]
+                pick = int(np.argmax(far))
+            else:
+                pick = 0  # strongest corner first
+            spread.append(cand[pick])
+            chosen.append(cand.pop(pick))
+        out = np.asarray(chosen, dtype=np.int32).reshape(-1, 2)
+        print(
+            f"[SuperPoint Balanced] Object {obj_id}: {len(pts)} SuperPoint points, "
+            f"topped up to {len(out)} with silhouette corners"
+        )
+        return out
 
     def _sample_with_margin(self, context: SamplerContext, obj_id: int, margin: int):
         frame = context.frame

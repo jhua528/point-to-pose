@@ -15,9 +15,11 @@ A box fit to what one view sees is only as good as the view: a part half
 hidden behind a hand gets a box too short, or one tilted across the hidden
 side and too large. When the client sends a mesh of the object (one estimated
 from a demonstration, say), the box is the mesh's own instead, placed by
-fitting its pose to the observations. The mesh supplies the part's shape, so
-the box keeps its proportions; one uniform scale is fitted too, since a
-similar mesh need not be the part's size. A mesh that already is keeps
+fitting its pose to the observations. The mesh supplies the part's shape;
+its size is fitted too, since a similar mesh need not be the part's size nor
+quite its proportions: one scale, then -- where the view shows the part's
+length along them -- a scale along each of the mesh's box axes, fitted with
+the pose (MODEL_STRETCH_*). A mesh that already is the part's size keeps
 exactly scale 1.
 A failed pose fit stays invalid while subsequent frames are retried in the
 background. Point-cloud boxes are used only when no mesh was supplied.
@@ -32,6 +34,7 @@ import json
 import time
 import zlib
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import cv2
@@ -279,6 +282,17 @@ MODEL_MASK_GROW_PX = 4
 # depth-connected component when it clearly dominates the foreground.
 MODEL_DEPTH_GAP_M = 0.03
 MODEL_COMPONENT_MIN_SHARE = 0.7
+# A piece of the mask not touching the main one is kept where what lies
+# between them in the image is nearer than both (MODEL_BEHIND_SHARE of it, by
+# MODEL_HIDDEN_M) -- one part seen round an occluder -- and their facing edges
+# could be one part's: apart in depth by no more than MODEL_BEHIND_DEPTH_RATIO
+# times their gap across the view, plus MODEL_DEPTH_GAP_M. A bar seen 36 deg
+# off end-on with a ring on it showed its far end as a separate 110 px piece,
+# dropped, and was fitted 221 mm long of 340. A piece touching the main one,
+# a depth jump between them, is still dropped: a hand.
+MODEL_BEHIND_MIN_PX = 10
+MODEL_BEHIND_SHARE = 0.7
+MODEL_BEHIND_DEPTH_RATIO = 3.0
 # Share of point-to-point in the ICP metric; the rest is point-to-plane, which
 # alone lets a flat face slide along itself.
 MODEL_POINT_WEIGHT = 0.1
@@ -315,10 +329,42 @@ MODEL_SCALE_ROUNDS = 10
 MODEL_STRETCH_MAX = 1.4
 MODEL_STRETCH_MIN_GAIN = 0.03
 MODEL_STRETCH_START_RATIO = 1.15
+# The proportions are fitted together with the pose too, by Gauss-Newton over
+# both (_ModelFit.stretch): the descent, one axis a step at a time, moves a
+# scale only a few percent from where it starts. The simulated bar, 340 by
+# 27 mm, has its reconstruction's length (386 mm) scaled 1.27 times its
+# width's (39 mm): at one scale it came out 268 mm long on a view of 334 mm,
+# the points past its ends 32 mm off it, and was refused; the descent took
+# its length from 0.696 to 0.703 of the mesh's. A round changes a scale by at
+# most MODEL_STRETCH_STEP. Its pairs narrow to MODEL_STRETCH_RADIUS_M, not to
+# MODEL_TOL_M: past that, the points beyond a short mesh's ends no longer
+# draw it out, and the bar stopped 6 mm short at each.
+MODEL_STRETCH_ROUNDS = 30
+MODEL_STRETCH_STEP = 1.15
+MODEL_STRETCH_RADIUS_M = 0.012
+# Within this share of its bound, a stretched scale is at it.
+MODEL_STRETCH_EDGE = 0.99
+# Fitted so, a scale only grows -- what the fit at one scale leaves wrong is
+# a mesh too short where the view shows more: the bar's length, the ring's
+# thickness; the cost leans to a mesh a little small (MODEL_SCALE_MIN_GAIN)
+# -- and by MODEL_STRETCH_MAX at most: this fits the mesh's proportions, its
+# size is measure_scale()'s. Unbounded, a pose at scale 1 on a patch of the
+# tester grew 1.9 times along its length and 3.1 across, 152 mm long where
+# the part is 194, and fitted better than the right pose. A scale that ends
+# at that bound wants more, as one at the end of MODEL_SCALE_RANGE does: the
+# shape does not match, and the stretch is not taken -- the tester's mesh, on
+# a sample, pressed both its long sides there, flattened onto it. (The bar
+# grew 1.30 times, the ring's thickness 1.15.)
 # An axis is stretched only where the view spans it: the observed points
-# cover at least this share of the mesh's extent along it. A bar seen from
-# one side shows half its round, and its depth stretched to fit that half.
-MODEL_STRETCH_SEEN = 0.7
+# cover at least this share of the mesh's extent along it, from their
+# MODEL_SEEN_PERCENTILE-th to their (100 - it)-th percentile. A bar seen from
+# one side shows half its round, and its depth stretched to fit that half:
+# 0.62-0.76 of it. Between the 5th and 95th percentiles an upright tester's
+# depth, which only its top face spans, came to 0.61 -- 0.88 between the 2nd
+# and 98th -- and the proportions its fit had started from, 189 x 62 x 41 mm
+# of the part's 194 x 62 x 42, were dropped for one scale: coarse, 48 mm wide.
+MODEL_STRETCH_SEEN = 0.82
+MODEL_SEEN_PERCENTILE = 2
 # A length is measured only where the view shows both its ends: of the mesh's
 # camera-facing points in the last MODEL_END_SHARE of it at either end, no
 # more than MODEL_END_HIDDEN may be hidden -- something nearer in front, or
@@ -332,6 +378,15 @@ MODEL_STRETCH_SEEN = 0.7
 # again (MODEL_UPGRADE_INTERVAL_SEC).
 MODEL_END_SHARE = 0.08
 MODEL_END_HIDDEN = 0.3
+# And a length is measured only where the part is seen to stop at its ends:
+# MODEL_END_PROBE_M past the end's camera-facing points, no more than
+# MODEL_END_HIDDEN of those in the image lie behind something nearer --
+# outside the part's own mask, off the support. A mesh fitted short into an
+# occluder ends just in front of it, its own end in view: the bar seen nearly
+# end-on, a ring on it, came out 221 mm of 340 and measured (ends_open()).
+# Past the image's edge is no evidence either way -- the RI bar's end 2 cm in
+# from it was measured right -- unless all but a few probes are.
+MODEL_END_PROBE_M = 0.03
 # A size the view could not measure is still at least what was seen: along
 # each of its axes the mesh spans the observed points (2nd to 98th
 # percentile), less this for depth noise. A hidden end costs nothing, so half
@@ -356,6 +411,17 @@ MODEL_ENDS_ELONGATION = 1.5
 MODEL_ENDS_COST_SLACK = 0.05
 MODEL_ENDS_MARGIN = 0.8
 MODEL_PROFILE_BINS = 16
+# Which way round a long part is about its length. The tester's two long
+# sides differ only by its probe and the groove under it: with its lower
+# half behind PP-S4-1's occluder, the demonstration mesh turned half round
+# about its length cost 0.4779 and the right way round 0.4780 -- the view
+# cannot tell them apart, and no profile does either. So where a part's box
+# is MODEL_ENDS_ELONGATION times longer than wide, the pose turned half round
+# about its length is refitted too. Cheaper by more than MODEL_SPIN_COST_SLACK,
+# it is taken instead; within that either way, the fit is sent in doubt
+# (model_spin_doubt: that pose relative to it), for the person to say which.
+# Seen whole (PP-S1-1, rendered), the wrong way round cost 0.054 more.
+MODEL_SPIN_COST_SLACK = 0.02
 # The pose search runs at scale 1, and also at the observed size when that
 # is this far from the mesh's: a mesh twice a bar's length fits anywhere
 # along it, and scaled about its centre afterwards it leaves the part.
@@ -379,6 +445,20 @@ MODEL_RETRY_INTERVAL_SEC = 3.0
 # over coarse, measured over not. A fine, measured fit is kept: the part's
 # size is the part's, and a later view half hidden cannot measure it better.
 MODEL_UPGRADE_INTERVAL_SEC = 6.0
+# Kept, a fit is carried by the tracked motion, and the motion can go wrong
+# with the track not lost: a ring lifted face-on in the gripper was tracked
+# through its hole, on the camera's ray to it but 147 mm too deep (the far
+# background seen through the hole pulled its depth), the mesh with it, and
+# the Agent saw the gripper holding nothing. So every frame the carried mesh
+# is scored on what the camera sees there, on MODEL_CHECK_POINTS (mesh,
+# observed) points, and a frame where the observed points are off it
+# (carried_fit_rejection()) is replied without it: held up, the ring's track
+# then jumped 217-240 mm off on one frame in three to five, the frames
+# between them right, and every one of those frames went out. Off it on
+# MODEL_CHECK_FAILS frames running, the fit is no longer the part's where
+# the tracker carries it, and it is fitted again at once.
+MODEL_CHECK_POINTS = (1000, 600)
+MODEL_CHECK_FAILS = 2
 
 
 # The surface seen of each object, kept in its frame at the init frame: every
@@ -536,6 +616,11 @@ class ObjectModel:
         self.fitted_linear = None
         self.fitted_quality = None
         self.fitted_measured = False
+        # The fit turned half round about its length, relative to it, where
+        # the view fits that about as well (MODEL_SPIN_COST_SLACK); and an id
+        # of the fit, new with every fit, for what is said of it to hold to.
+        self.fitted_spin_doubt = None
+        self.fitted_id = None
 
 
 def _pixels(P, K):
@@ -600,6 +685,22 @@ def _stretch_allowed(scale):
                 and np.all((ratio >= 1 / MODEL_STRETCH_MAX) & (ratio <= MODEL_STRETCH_MAX)))
 
 
+def _within_stretch(scale):
+    """Three per-axis scales brought within MODEL_SCALE_RANGE and within
+    MODEL_STRETCH_MAX of their overall size, their order kept; None if that
+    does not settle."""
+    f = np.asarray(scale, np.float64)
+    lo, hi = MODEL_SCALE_RANGE
+    limit = MODEL_STRETCH_MAX * (1 - 1e-9)
+    for _ in range(30):
+        f = np.clip(f, lo, hi)
+        if _stretch_allowed(f):
+            return f
+        overall = _overall(f)
+        f = overall * np.clip(f / overall, 1 / limit, limit)
+    return None
+
+
 def _signed_permutations():
     """The 24 rotations that map the coordinate axes onto themselves."""
     out = []
@@ -612,12 +713,14 @@ def _signed_permutations():
     return out
 
 
-def connected_depth_foreground(mask, depth):
+def connected_depth_foreground(mask, depth, cam=None):
     """Remove small mask islands separated by a depth jump from the main part.
 
     A 2D connected mask can cross an occluder's boundary. Use adjacent valid
     pixels whose depth differs by at most 3 cm as graph edges. If no component
     dominates, retain the evidence for the pose checks instead of choosing one.
+    With `cam` (every pixel's camera-frame point), an island the main part
+    continues into behind an occluder is kept (MODEL_BEHIND_SHARE).
     """
     count = int(mask.sum())
     indices = np.full(mask.shape, -1, dtype=np.int32)
@@ -633,9 +736,38 @@ def connected_depth_foreground(mask, depth):
     sizes = np.bincount(labels)
     if not len(sizes) or sizes.max() < max(MIN_BOX_POINTS, MODEL_COMPONENT_MIN_SHARE * count):
         return mask
+    main = sizes.argmax()
+    keep = labels == main
+    if cam is not None:
+        ys, xs = np.nonzero(mask)                 # the order of `indices`
+        main_px = np.column_stack([xs[keep], ys[keep]])
+        tree = cKDTree(main_px)
+        for label in np.flatnonzero(sizes >= MODEL_BEHIND_MIN_PX):
+            if label != main and _behind_occluder(np.column_stack([xs, ys])[labels == label],
+                                                  main_px, tree, depth, cam):
+                keep |= labels == label
     result = np.zeros_like(mask)
-    result[mask] = labels == sizes.argmax()
+    result[mask] = keep
     return result
+
+
+def _behind_occluder(piece, main_px, tree, depth, cam):
+    """Whether a mask piece (pixels, x y) is the main part's continuation
+    behind something nearer; see MODEL_BEHIND_SHARE."""
+    dist, nearest = tree.query(piece)
+    i = int(np.argmin(dist))
+    if dist[i] <= 1.5:
+        return False                             # touching: a depth jump between them
+    a, b = piece[i], main_px[nearest[i]]
+    n = int(np.ceil(dist[i]))
+    share = np.arange(1, n) / n
+    between = np.round(a[None] + (b - a)[None] * share[:, None]).astype(np.int64)
+    da, db = depth[a[1], a[0]], depth[b[1], b[0]]
+    seen = depth[between[:, 1], between[:, 0]]
+    if not len(seen) or np.mean((seen > 0) & (seen < da + (db - da) * share - MODEL_HIDDEN_M)) < MODEL_BEHIND_SHARE:
+        return False
+    gap = cam[a[1], a[0]] - cam[b[1], b[0]]
+    return abs(gap[2]) <= MODEL_BEHIND_DEPTH_RATIO * np.hypot(gap[0], gap[1]) + MODEL_DEPTH_GAP_M
 
 
 class _ModelFit:
@@ -647,6 +779,7 @@ class _ModelFit:
         self.depth = cam[..., 2]
         kernel = np.ones((2 * MODEL_MASK_GROW_PX + 1,) * 2, np.uint8)
         self.grown = cv2.dilate(mask.astype(np.uint8), kernel) > 0
+        self.mask = mask
         self.plane = None
         if plane is not None:
             n, p = plane
@@ -662,7 +795,7 @@ class _ModelFit:
                           and model.extent.min() > 2 * PLANE_TOL_M)
         obs_mask = keep if use_foreground else mask
         if use_foreground:
-            obs_mask = connected_depth_foreground(obs_mask, self.depth)
+            obs_mask = connected_depth_foreground(obs_mask, self.depth, cam)
         obs = cam[obs_mask]
         self.observation_note = f"{len(obs)}/{int(mask.sum())} depth points"
         if use_foreground and np.any(mask & ~keep):
@@ -671,7 +804,18 @@ class _ModelFit:
             self.observation_note += ", isolated depth components removed"
         self.obs = obs[rng.permutation(len(obs))[:MODEL_FINE_POINTS]]
         self.obs_tree = cKDTree(self.obs)
-        self.obb = min_obb(cam[obs_mask if use_foreground else keep])
+        self._obb_points = cam[obs_mask if use_foreground else keep]
+        self._obb = None
+
+    @property
+    def obb(self):
+        """The observed points' minimal box, (R, centre, extent): where the
+        pose search starts (candidates(), start_scales()); scoring a given
+        pose (carried_fit_rejection()) needs none, and it costs most of the
+        set-up."""
+        if self._obb is None:
+            self._obb = min_obb(self._obb_points)
+        return self._obb
 
     def linear(self, scale):
         """The mesh-frame linear map of a scale: one number scales the mesh
@@ -705,15 +849,17 @@ class _ModelFit:
                 moved[key] = terms[key]
         return R2, t2, moved, raised, note + f"; raised {factor:.2f} times to cover what was seen"
 
-    def axes_seen(self, R, t, scale):
+    def axes_seen(self, R, t, scale, ends=True):
         """Per mesh box axis, whether the view shows the part's length along
         it: the observed points span MODEL_STRETCH_SEEN of the mesh's extent
-        there, and both ends show (ends_seen()). A mesh stretched past what
-        was seen spans less of it, and fails."""
+        there, and (`ends`) both ends show (ends_seen()). A mesh stretched
+        past what was seen spans less of it, and fails."""
         scale = np.broadcast_to(np.asarray(scale, np.float64), (3,))
         along = self.obs @ (R @ self.model.box[:3, :3])
-        span = np.percentile(along, 95, axis=0) - np.percentile(along, 5, axis=0)
-        return (span >= MODEL_STRETCH_SEEN * scale * self.model.extent) & self.ends_seen(R, t, scale)
+        span = (np.percentile(along, 100 - MODEL_SEEN_PERCENTILE, axis=0)
+                - np.percentile(along, MODEL_SEEN_PERCENTILE, axis=0))
+        seen = span >= MODEL_STRETCH_SEEN * scale * self.model.extent
+        return seen & self.ends_seen(R, t, scale) if ends else seen
 
     def ends_seen(self, R, t, scale):
         """Per mesh box axis, whether the view shows both of the mesh's ends
@@ -739,6 +885,45 @@ class _ModelFit:
             for end in (along <= lo, along >= hi):
                 front = end & seen
                 if front.sum() >= 10 and hidden[front].mean() > MODEL_END_HIDDEN:
+                    out[k] = False
+        return out
+
+    def ends_open(self, R, t, scale):
+        """Per mesh box axis, whether just past both of the mesh's ends the
+        view shows the part stopping there; see MODEL_END_PROBE_M."""
+        M = self.linear(scale)
+        P = self.model.points @ (R @ M).T + t
+        seen = _seen_from_camera(P, self.K, _overall(scale) * self.model.spacing, self.depth.shape)
+        centre = R @ (M @ self.model.box[:3, 3]) + t
+        h, w = self.depth.shape
+        out = np.ones(3, bool)
+        for k in range(3):
+            axis = R @ self.model.box[:3, k]
+            along = (P - centre) @ axis
+            lo, hi = np.quantile(along, [MODEL_END_SHARE, 1 - MODEL_END_SHARE])
+            for end, outward in ((along <= lo, -axis), (along >= hi, axis)):
+                probe = P[end & seen] + MODEL_END_PROBE_M * outward
+                if self.plane is not None:
+                    n, p0 = self.plane
+                    probe = probe[(probe - p0) @ n <= PLANE_TOL_M]      # not into the support
+                if len(probe) < 10:
+                    continue
+                uv = np.round(_pixels(probe, self.K)).astype(np.int64)
+                inside = ((probe[:, 2] > 0) & (uv[:, 0] >= 0) & (uv[:, 0] < w)
+                          & (uv[:, 1] >= 0) & (uv[:, 1] < h))
+                if inside.sum() < 10:
+                    out[k] = False                  # nothing past this end in view
+                    continue
+                u, v = uv[inside, 0], uv[inside, 1]
+                d = self.depth[v, u]
+                # Not the part itself in front (its own mask), but anything
+                # else, however near its edge: seen nearly end-on, the ring
+                # hiding the bar's middle was a few pixels across.
+                nearer = (d > 0) & (d < probe[inside, 2] - MODEL_HIDDEN_M) & ~self.mask[v, u]
+                if self.plane is not None:
+                    n, p0 = self.plane
+                    nearer &= (self.cam[v, u] - p0) @ n < -PLANE_TOL_M
+                if nearer.mean() > MODEL_END_HIDDEN:
                     out[k] = False
         return out
 
@@ -837,11 +1022,20 @@ class _ModelFit:
         out["width"] = float(np.sort(np.broadcast_to(scale, (3,)) * self.model.extent)[1])
         return out
 
-    def step(self, R, t, terms, radius):
-        """One Gauss-Newton step of the pose, about the mesh's centre."""
+    def step(self, R, t, terms, radius, scale=None, free=(), bounds=None):
+        """One Gauss-Newton step of the pose, about the mesh's centre; and of
+        the log of `scale` along the box axes `free` (indices), about the
+        mesh's box centre, within `bounds` (two triples of scales).
+        Returns R, t and the scale."""
         P = terms["P"]
         c = P.mean(0)
-        H, g = np.zeros((6, 6)), np.zeros(6)
+        free = list(free)
+        n_par = 6 + len(free)
+        if free:
+            scale = np.broadcast_to(np.asarray(scale, np.float64), (3,)).copy()
+            axes = (R @ self.model.box[:3, :3])[:, free]
+            box_c = R @ (self.linear(scale) @ self.model.box[:3, 3]) + t
+        H, g = np.zeros((n_par, n_par)), np.zeros(n_par)
         lam = MODEL_POINT_WEIGHT
         for p, q, n, dist in terms["pairs"]:
             use = dist < radius
@@ -849,10 +1043,14 @@ class _ModelFit:
                 continue
             p, q, n = p[use], q[use], n[use]
             d, r = p - c, p - q
-            J = np.zeros((len(p), 3, 6))
+            J = np.zeros((len(p), 3, n_par))
             J[:, 0, 1], J[:, 0, 2], J[:, 1, 0] = d[:, 2], -d[:, 1], -d[:, 2]
             J[:, 1, 2], J[:, 2, 0], J[:, 2, 1] = d[:, 0], d[:, 1], -d[:, 0]
-            J[:, :, 3:] = np.eye(3)
+            J[:, :, 3:6] = np.eye(3)
+            if free:
+                # Stretched along a box axis, a point moves along it by its
+                # distance from the box centre along it.
+                J[:, :, 6:] = axes[None] * ((p - box_c) @ axes)[:, None, :]
             nJ = np.einsum("ki,kij->kj", n, J)
             k = 1.0 / len(p)
             H += k * (lam * np.einsum("kij,kil->jl", J, J) + (1 - lam) * nJ.T @ nJ)
@@ -861,23 +1059,52 @@ class _ModelFit:
         below = terms["below"] > 0
         if below.any():
             n = self.plane[0]
-            a = np.hstack([np.cross(P[below] - c, n), np.tile(n, (below.sum(), 1))])
+            a = np.hstack([np.cross(P[below] - c, n), np.tile(n, (below.sum(), 1))]
+                          + ([((P[below] - box_c) @ axes) * (n @ axes)] if free else []))
             k = 1.0 / len(P)
             H += k * a.T @ a
             g += k * a.T @ terms["below"][below]
         if not np.any(H):
-            return R, t
-        xi = -np.linalg.solve(H + (1e-6 * np.trace(H) / 6 + 1e-12) * np.eye(6), g)
+            return R, t, scale
+        xi = -np.linalg.solve(H + (1e-6 * np.trace(H) / n_par + 1e-12) * np.eye(n_par), g)
         E = _rotation(xi[:3])
-        return E @ R, E @ (t - c) + c + xi[3:]
+        R, t = E @ R, E @ (t - c) + c + xi[3:6]
+        if free:
+            stretched = scale.copy()
+            stretched[free] *= np.exp(np.clip(xi[6:], -np.log(MODEL_STRETCH_STEP), np.log(MODEL_STRETCH_STEP)))
+            if bounds is not None:
+                stretched = np.clip(stretched, *bounds)
+            stretched = _within_stretch(stretched)
+            if stretched is not None:
+                centre = R @ (self.linear(scale) @ self.model.box[:3, 3]) + t
+                scale = stretched
+                t = centre - R @ (self.linear(scale) @ self.model.box[:3, 3])
+        return R, t, scale
 
     def icp(self, scale, R, t, rounds, mesh_n, obs_n, radius):
         for i in range(rounds):
             terms = self.terms(scale, R, t, mesh_n, obs_n)
             if terms is None:
                 return R, t, None
-            R, t = self.step(R, t, terms, max(MODEL_TOL_M, radius * 0.75 ** i))
+            R, t, _ = self.step(R, t, terms, max(MODEL_TOL_M, radius * 0.75 ** i))
         return R, t, self.terms(scale, R, t, mesh_n, obs_n)
+
+    def stretch(self, scale, R, t, free, rounds=MODEL_STRETCH_ROUNDS, radius=MODEL_SEARCH_M):
+        """ICP over the pose and, with it, the scale along the box axes
+        `free` (three booleans), which only grows, by MODEL_STRETCH_MAX at
+        most: R, t, terms and the three scales. Its pairs are ICP's: a mesh
+        too short for what was seen is drawn out by the points past its ends,
+        as far as the camera seeing past it lets it."""
+        scale = np.broadcast_to(np.asarray(scale, np.float64), (3,)).copy()
+        bounds = scale.copy(), scale * MODEL_STRETCH_MAX
+        free = np.flatnonzero(free)
+        for i in range(rounds):
+            terms = self.terms(scale, R, t, MODEL_SAMPLES, MODEL_FINE_POINTS)
+            if terms is None:
+                return R, t, None, scale
+            R, t, scale = self.step(R, t, terms, max(MODEL_STRETCH_RADIUS_M, radius * 0.85 ** i), scale, free,
+                                    bounds)
+        return R, t, self.terms(scale, R, t, MODEL_SAMPLES, MODEL_FINE_POINTS), scale
 
     def polish(self, scale, R, t, terms, free_scale=False, free_axes=False):
         """Descend the cost itself, a step along or about each of the mesh's
@@ -972,7 +1199,10 @@ class _ModelFit:
         proportions, three numbers along the mesh's box axes matched side for
         side by length. A one-sided view can show the wrong proportions -- a
         bar seen from one side looks flat -- so this is only a start: the
-        pose search keeps whichever fits best."""
+        pose search keeps whichever fits best. Proportions past what may be
+        stretched are brought within it, not dropped: the simulated bar seen
+        from one side, 334 by 26 by 16 mm, looked flatter than any stretch
+        allows, and the starts left all fitted it too short."""
         observed, mesh = np.sort(self.obb[2]), np.sort(self.model.extent)
         s = float(np.clip(observed[1] / mesh[1], *MODEL_SCALE_RANGE))
         out = [1.0]
@@ -985,7 +1215,8 @@ class _ModelFit:
             f = np.empty(3)
             f[np.argsort(self.model.extent)] = (np.clip(_overall(ratio), *MODEL_SCALE_RANGE)
                                                 * np.clip(relative, 1 / MODEL_STRETCH_MAX, MODEL_STRETCH_MAX))
-            if _stretch_allowed(f):
+            f = _within_stretch(f)
+            if f is not None:
                 out.append(f)
         return out
 
@@ -1028,8 +1259,11 @@ class _ModelFit:
             if np.ndim(s):
                 # A start's proportions found the pose. They stand only along
                 # the axes the view spans, both ends seen; along the others
-                # -- a bar's depth, seen from one side -- the part takes the
-                # overall size of the rest, about the same centre.
+                # -- a bar's depth, seen from one side; a length one end of
+                # which is hidden, seen short -- the part takes the overall
+                # size of the rest, about the same centre. (Not the ends'
+                # test: a ring's diameter with an end behind its bar kept,
+                # it came out 51 mm of 60.)
                 seen = self.axes_seen(R, t, s)
                 if not seen.all():
                     centre = R @ (self.linear(s) @ self.model.box[:3, 3]) + t
@@ -1065,17 +1299,29 @@ class _ModelFit:
                             f"contradiction {at_start['contradiction']:.2f}")
                 else:
                     note = f"measured {measured:.3f}, too little gain to apply"
-                # Then its proportions, on the same clear enough view.
-                Rp, tp, p_terms, p_scale = self.polish(scale, R, t, terms, free_axes=True)
+                # Then its proportions, on the same clear enough view: by the
+                # descent, and drawn out with the pose (stretch(); its pose
+                # alone descended after, so that it only grows).
+                tries = [self.polish(scale, R, t, terms, free_axes=True)]
+                seen = self.axes_seen(R, t, scale)
+                if seen.any():
+                    Rs2, ts2, s_terms, s2 = self.stretch(scale, R, t, seen)
+                    bound = np.broadcast_to(np.asarray(scale, np.float64), (3,)) * MODEL_STRETCH_MAX
+                    if s_terms is not None and not np.any(s2[seen] >= MODEL_STRETCH_EDGE * bound[seen]):
+                        tries.append(self.polish(s2, Rs2, ts2, s_terms))
+                Rp, tp, p_terms, p_scale = min(tries, key=lambda r: r[2]["cost"])
                 if p_terms["cost"] < terms["cost"] - MODEL_STRETCH_MIN_GAIN:
                     R, t, terms, scale = Rp, tp, p_terms, p_scale
                     note += f"; proportions measured, {_describe(scale)}"
                 # Measured only if, as fitted, the two longest lengths show their ends.
                 longest = np.argsort(np.broadcast_to(scale, (3,)) * self.model.extent)[1:]
                 ends = self.ends_seen(R, t, scale)[longest].all()
-                terms["measured"] = ts_terms is not None and not edge and bool(ends)
+                stops = self.ends_open(R, t, scale)[longest].all()
+                terms["measured"] = ts_terms is not None and not edge and bool(ends) and bool(stops)
                 if ts_terms is not None and not edge and not ends:
                     note += "; not counted as measured: an end of the part is hidden"
+                elif ts_terms is not None and not edge and not stops:
+                    note += "; not counted as measured: the part may go on behind something past an end"
             if not terms["measured"]:
                 R, t, terms, scale, note = self.cover_seen(R, t, terms, scale, note)
             if np.ndim(start) or start != 1.0:
@@ -1123,6 +1369,46 @@ class _ModelFit:
         terms["scale_note"] = (terms.get("scale_note", "")
                                + f"; ends kept: profile mismatch {here:.2f} against {there:.2f}")
         return terms, R, t, scale, quality
+
+    def settle_spin(self, terms, R, t, scale, quality):
+        """(terms, R, t, scale, quality, doubt): the pose, or the same turned
+        half round about its length where that costs MODEL_SPIN_COST_SLACK
+        less; doubt, the other way round as a transform of the scaled mesh
+        relative to the pose, where the two cost within that, else None."""
+        extent = np.broadcast_to(scale, (3,)) * self.model.extent
+        order = np.argsort(extent)
+        if extent[order[2]] < MODEL_ENDS_ELONGATION * extent[order[1]]:
+            return terms, R, t, scale, quality, None
+        # A half turn about the long box axis, about the box centre.
+        B = self.model.box[:3, :3]
+        flip = B @ np.diag([1.0 if k == order[2] else -1.0 for k in range(3)]) @ B.T
+        M = self.linear(scale)
+        centre = R @ (M @ self.model.box[:3, 3]) + t
+        R2 = R @ flip
+        R2, t2, terms2 = self.icp(scale, R2, centre - R2 @ (M @ self.model.box[:3, 3]),
+                                  MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * MODEL_TOL_M)
+        if terms2 is None:
+            return terms, R, t, scale, quality, None
+        R2, t2, terms2, _ = self.polish(scale, R2, t2, terms2)
+        quality2 = ("fit" if not model_pose_rejection(terms2)
+                    else "coarse" if not model_pose_rejection(terms2, coarse=True) else None)
+        # Refitted back round to the pose, it is no other way round.
+        turned = np.degrees(np.arccos(np.clip((np.trace(R.T @ R2) - 1) / 2, -1, 1)))
+        if quality2 is None or (quality == "fit" and quality2 != "fit") or turned < 90:
+            return terms, R, t, scale, quality, None
+        if terms2["cost"] < terms["cost"] - MODEL_SPIN_COST_SLACK:
+            terms2["scale_note"] = (terms.get("scale_note", "") + f"; turned half round about its length: "
+                                    f"cost {terms2['cost']:.3f} against {terms['cost']:.3f}")
+            terms2["measured"] = terms.get("measured", False)
+            return terms2, R2, t2, scale, quality2, None
+        if terms2["cost"] > terms["cost"] + MODEL_SPIN_COST_SLACK:
+            return terms, R, t, scale, quality, None
+        pose, other = np.eye(4), np.eye(4)
+        pose[:3, :3], pose[:3, 3] = R, t
+        other[:3, :3], other[:3, 3] = R2, t2
+        terms["scale_note"] = (terms.get("scale_note", "") + f"; which way round about its length is in "
+                               f"doubt: turned half round costs {terms2['cost']:.3f} against {terms['cost']:.3f}")
+        return terms, R, t, scale, quality, np.linalg.inv(pose) @ other
 
     def profile_mismatch(self, R, t, scale):
         """How unlike the observed points the mesh's seen side is in width
@@ -1242,11 +1528,15 @@ def fit_model_box(model, view, K, rng=None):
     """
     model.fitted_pose = model.fitted_scale = model.fitted_linear = None
     model.fitted_quality, model.fitted_measured = None, False
+    model.fitted_spin_doubt = model.fitted_id = None
     fit = _ModelFit(model, view, K, rng or np.random.default_rng(0))
     result = fit.run()
     if result is None:
         return None, "no pose left any mesh point in view"
     terms, R, t, scale, quality = result
+    doubt = None
+    if quality is not None:
+        terms, R, t, scale, quality, doubt = fit.settle_spin(terms, R, t, scale, quality)
     stats = (f"fitness {terms['fitness']:.2f}, contradiction {terms['contradiction']:.2f}, "
              f"penetration {terms['penetration']:.2f}, {terms['hidden']:.0%} hidden "
              f"({terms['unmasked']:.0%} outside the mask at the mesh's depth), "
@@ -1266,6 +1556,7 @@ def fit_model_box(model, view, K, rng=None):
     model.fitted_scale = _overall(scale)
     model.fitted_linear = M
     model.fitted_quality, model.fitted_measured = quality, bool(terms["measured"])
+    model.fitted_spin_doubt, model.fitted_id = doubt, uuid.uuid4().hex
     label = ("mesh pose fit" if quality == "fit"
              else f"coarse mesh pose fit ({model_pose_rejection(terms)})")
     return (T, np.broadcast_to(scale, (3,)) * model.extent, f"{label}, {stats}"), None
@@ -1282,6 +1573,202 @@ def retry_mesh_fit(model, mask, metres, K):
         return fit, reason, model
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}", model
+
+
+def carried_fit_rejection(model, pose, mask, metres, K):
+    """Why the fitted mesh, at `pose` in this frame's camera (its fit carried
+    here by the tracked motion), no longer lies on what the camera sees of
+    the part; "" where it does, or where the view shows too little to say.
+
+    Only the observed points' side of the coarse acceptance is asked: their
+    share on the mesh and their 95th-percentile distance. A few millimetres
+    of tracked depth already put a thin part seen face-on past the coarse
+    contradiction (a ring 5 mm deep: over 0.25), and a part held up has for
+    its "support" whatever is behind it."""
+    view = observe(mask, metres, K)
+    if view is None:
+        return ""
+    fit = _ModelFit(model, view, K, np.random.default_rng(0))
+    linear = getattr(model, "fitted_linear", None)
+    linear = linear if linear is not None else model.fitted_scale * np.eye(3)
+    B = model.box[:3, :3]
+    scale = np.diag(B.T @ np.asarray(linear, np.float64) @ B)
+    terms = fit.terms(scale, pose[:3, :3], pose[:3, 3], *MODEL_CHECK_POINTS)
+    if terms is None:
+        return "no mesh point in view"
+    failed = []
+    if terms["fitness"] < MODEL_COARSE_MIN_FITNESS:
+        failed.append(f"fitness {terms['fitness']:.2f} < {MODEL_COARSE_MIN_FITNESS:.2f}")
+    p95 = min(MODEL_COARSE_MAX_P95_DISTANCE_M,
+              max(MODEL_COARSE_P95_FLOOR_M, MODEL_COARSE_MAX_P95_SHARE * terms["width"]))
+    if terms["p95_distance"] > p95:
+        failed.append(f"95th-percentile point distance {terms['p95_distance'] * 1000:.0f} mm > {p95 * 1000:.0f} mm")
+    return "; ".join(failed)
+
+
+# Locating an object by its mesh, for an object sent with a mesh and no click.
+# SAM2 proposes every mask in the view. The mesh's box rules most of them out
+# by size and proportions, which is cheap; the mesh's pose fit
+# (fit_model_box()) then runs on the LOCATE_FITS likeliest, and the best fit's
+# visible surface, projected into the image, gives the click: points inside
+# the part, as a person would pick them. The click comes from the fitted mesh
+# rather than from the proposal, because a proposal can be a piece of the
+# part (the label on a can) that the mesh fits as well.
+#
+# A proposal's area, in square metres at its depth, against the mesh's
+# smallest and largest face at the ends of MODEL_SCALE_RANGE, these factors
+# beyond: the bench, a wall, a speck are out.
+LOCATE_AREA_SLACK = (0.25, 1.5)
+# One view of a box shows two of its extents. The proposal's two longest
+# must be in the proportions of one such pair of the mesh's, within this.
+LOCATE_RATIO_SLACK = 1.6
+# Points of a proposal's surface its box is fit to; min_obb() of every pixel
+# of a large proposal costs more than the rest of the screening together.
+LOCATE_BOX_POINTS = 2000
+LOCATE_FITS = 4
+# A proposal this much inside an object already located is that object.
+LOCATE_TAKEN_SHARE = 0.5
+# Points per click, kept this far inside the visible surface's edge.
+LOCATE_PROMPTS = 3
+LOCATE_EDGE_PX = 4
+
+
+def _quick_fit(model, view, K):
+    """The mesh's pose on one proposal, for telling proposals apart: the
+    coarse stage of _ModelFit.run(), its best start refined, and nothing of
+    the scale measuring after (fit_boxes() fits the chosen one in full).
+    Returns (score, (R, t, scale)) or None: a pose the coarse acceptance
+    takes over one it does not, then its share of the observed points on
+    the mesh less its share seen through or pressed into what is there.
+
+    The observed size is always among the starts. Nothing here measures the
+    scale, and a mesh some 25 % off the part's size, within
+    MODEL_SCALE_START_RATIO, fails the coarse acceptance at 1: the ring's
+    69 mm mesh on the 60 mm simulated ring, standing face-on, overhung its
+    rim onto the background behind (contradiction 0.37), and the ring was
+    not located on its own mask; at the observed size, 0.14."""
+    fit = _ModelFit(model, view, K, np.random.default_rng(0))
+    mesh_n, obs_n, rounds = MODEL_COARSE
+    starts = fit.start_scales()
+    observed = float(np.clip(np.sort(fit.obb[2])[1] / np.sort(model.extent)[1], *MODEL_SCALE_RANGE))
+    if not any(np.ndim(s) == 0 and np.isclose(s, observed) for s in starts):
+        starts.append(observed)
+    best = None
+    for s in starts:
+        for R in fit.candidates():
+            t = fit.place(s, R, mesh_n)
+            R, t, terms = fit.icp(s, R, t, rounds, mesh_n, obs_n, MODEL_SEARCH_M)
+            if terms is not None and (best is None or terms["cost"] < best[0]):
+                best = (terms["cost"], R, t, s)
+    if best is None:
+        return None
+    _, R, t, s = best
+    R, t, terms = fit.icp(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS,
+                          2 * MODEL_TOL_M)
+    if terms is None:
+        return None
+    return ((not model_pose_rejection(terms, coarse=True),
+             terms["fitness"] - terms["contradiction"] - terms["penetration"]),
+            (R, t, s))
+
+
+def mesh_click(model, R, t, scale, metres, K):
+    """The click a mesh at a pose gives: (points, region), the points inside
+    the region of the image where the camera sees the mesh's surface, or
+    None if it sees none of it."""
+    B = model.box[:3, :3]
+    M = (B * np.broadcast_to(np.asarray(scale, np.float64), (3,))) @ B.T  # _ModelFit.linear()
+    P = model.points @ (R @ M).T + t
+    spacing = _overall(scale) * model.spacing
+    seen = _seen_from_camera(P, K, spacing, metres.shape)
+    uv = np.round(_pixels(P[seen], K)).astype(np.int64)
+    h, w = metres.shape
+    u, v = np.clip(uv[:, 0], 0, w - 1), np.clip(uv[:, 1], 0, h - 1)
+    d = metres[v, u]
+    # Not where something nearer hides it: that is the occluder's to show.
+    shown = np.isfinite(d) & (d > 0) & (np.abs(d - P[seen, 2]) <= MODEL_HIDDEN_M)
+    if shown.sum() < MIN_BOX_POINTS:
+        return None
+    region = np.zeros((h, w), np.uint8)
+    region[v[shown], u[shown]] = 1
+    # Samples land a few pixels apart; close the gaps between them.
+    gap = spacing * K[0, 0] / float(np.median(P[seen][shown, 2]))
+    size = 2 * int(np.ceil(gap)) + 1
+    region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((size, size), np.uint8))
+    inside = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+    points = [np.unravel_index(np.argmax(inside), inside.shape)]
+    deep = np.argwhere(inside >= LOCATE_EDGE_PX)
+    # The rest spread over the part, each farthest from those picked.
+    while len(points) < LOCATE_PROMPTS and len(deep):
+        far = np.min(np.linalg.norm(deep[:, None] - np.asarray(points)[None], axis=2), axis=1)
+        if far.max() < 2 * LOCATE_EDGE_PX:
+            break
+        points.append(tuple(deep[np.argmax(far)]))
+    return [[int(c), int(r)] for r, c in points], region > 0
+
+
+def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None):
+    """Where in the view an object is, by its mesh: (click, region, note),
+    the click as mesh_click() gives it and the model fitted, or
+    (None, None, reason). `clicked` are pixels of other objects, `taken` the
+    regions of those already located; proposals on them are skipped."""
+    f = float(K[0, 0])
+    m = np.sort(model.extent)[::-1]
+    low, high = MODEL_SCALE_RANGE
+    area_range = (m[1] * m[2] * low ** 2 * LOCATE_AREA_SLACK[0],
+                  m[0] * m[1] * high ** 2 * LOCATE_AREA_SLACK[1])
+    pairs = np.log([m[0] / m[1], m[0] / m[2], m[1] / m[2]])
+    h, w = metres.shape
+    clicked = [(min(max(int(round(v)), 0), h - 1), min(max(int(round(u)), 0), w - 1))
+               for u, v in clicked]
+    valid = np.isfinite(metres) & (metres > 0)
+    rng = np.random.default_rng(0)
+    shortlist = []
+    for mask in proposals:
+        if any(mask[r, c] for r, c in clicked):
+            continue
+        if taken is not None and (mask & taken).sum() > LOCATE_TAKEN_SHARE * mask.sum():
+            continue
+        z = metres[mask & valid]
+        if len(z) < MIN_BOX_POINTS:
+            continue
+        if not area_range[0] <= mask.sum() * (np.median(z) / f) ** 2 <= area_range[1]:
+            continue
+        try:
+            view = observe(mask, metres, K)
+        except Exception:
+            continue
+        if view is None or view[2].sum() < MIN_BOX_POINTS:
+            continue
+        surface = view[0][view[2]]
+        surface = surface[rng.permutation(len(surface))[:LOCATE_BOX_POINTS]]
+        e = np.sort(min_obb(surface)[2])[::-1]
+        if not low * m[2] <= e[0] <= high * m[0]:
+            continue
+        miss = float(np.min(np.abs(np.log(e[0] / max(e[1], 1e-4)) - pairs)))
+        if miss <= np.log(LOCATE_RATIO_SLACK):
+            shortlist.append((miss, view))
+    if not shortlist:
+        return None, None, f"none of {len(proposals)} proposals is the mesh's size and shape"
+    best, tried = None, 0
+    for _, view in sorted(shortlist, key=lambda item: item[0])[:LOCATE_FITS]:
+        tried += 1
+        try:
+            found = _quick_fit(model, view, K)
+        except Exception:
+            traceback.print_exc()
+            continue
+        if found is not None and (best is None or found[0] > best[0]):
+            best = found
+    if best is None or not best[0][0]:
+        return None, None, f"the mesh fits none of {tried} likely proposals"
+    (_, score), pose = best
+    found = mesh_click(model, *pose, metres, K)
+    if found is None:
+        return None, None, "the fitted mesh shows no surface in the view"
+    note = (f"score {score:.2f}, best of {tried} fitted of {len(shortlist)} "
+            f"shortlisted of {len(proposals)} proposals")
+    return found[0], found[1], note
 
 
 def decode_models(meta, parts, count):
@@ -1401,6 +1888,8 @@ class PoseServer:
                                else [model is not None for model in models])
         self.model_errors = [None] * len(points)
         self.model_retry_after = [time.monotonic() + MODEL_RETRY_INTERVAL_SEC] * len(points)
+        self.model_check_fails = [0] * len(points)
+        self.model_withheld = [False] * len(points)
         try:
             # Same call as a preview, made on the freshly built pipeline before
             # add_user_points(), which is the state a preview sees.
@@ -1558,6 +2047,59 @@ class PoseServer:
                     print(f"[server] object {index}: {reason}", flush=True)
                 self.model_errors[index] = reason
 
+    def check_carried_meshes(self, motions, frame):
+        """Score each kept mesh fit, carried into this frame by its tracked
+        motion, on this frame's mask and depth: off the part, it is withheld
+        from this frame's reply (model_withheld); off it MODEL_CHECK_FAILS
+        frames running, it is dropped and fitted again now."""
+        models = getattr(self, "fitted_models", None)
+        if not models:
+            return
+        withheld = getattr(self, "model_withheld", None)
+        if withheld is None or len(withheld) != len(models):
+            withheld = self.model_withheld = [False] * len(models)
+        withheld[:] = [False] * len(models)
+        try:
+            h, w = frame.depth.shape
+            masks = as_numpy(getattr(frame, "mask", None))
+            if masks.shape == (len(models), 1, h, w):
+                masks = masks[:, 0]
+            if masks.shape != (len(models), h, w):
+                return
+            metres = as_numpy(frame.depth) / frame.depth_factor
+            K = np.asarray(frame.intrinsics, dtype=np.float64)
+            lost = [bool(getattr(obj, "lost", False)) for obj in self.pipeline.objects]
+        except Exception:
+            return
+        fails = getattr(self, "model_check_fails", None)
+        if fails is None or len(fails) != len(models):
+            fails = self.model_check_fails = [0] * len(models)
+        for index, model in enumerate(models):
+            if model is None or model.fitted_pose is None or lost[index]:
+                fails[index] = 0
+                continue
+            try:
+                motion = np.asarray(motions[index], dtype=np.float64)
+                if motion.shape != (4, 4) or not np.isfinite(motion).all():
+                    continue
+                why = carried_fit_rejection(model, motion @ model.fitted_pose,
+                                            np.asarray(masks[index]) > 0, metres, K)
+            except Exception:
+                traceback.print_exc()
+                continue
+            if why and not fails[index]:
+                print(f"[server] object {index}: mesh pose withheld from frame {frame.id}: "
+                      f"the carried fit is off the part ({why})", flush=True)
+            fails[index] = fails[index] + 1 if why else 0
+            withheld[index] = bool(why)
+            if fails[index] >= MODEL_CHECK_FAILS:
+                fails[index] = 0
+                self.fitted_models[index] = None
+                self.model_retry_after[index] = time.monotonic()
+                self.model_errors[index] = (f"the carried mesh pose no longer fits the view ({why}); "
+                                            "fitting it again")
+                print(f"[server] object {index}: {self.model_errors[index]}", flush=True)
+
     def record_surfaces(self, motions, frame):
         """Add this frame's view of each tracked object to its SurfaceMemory."""
         try:
@@ -1605,6 +2147,9 @@ class PoseServer:
                 result = box_in_camera(motion, *box, frame.intrinsics, frame.rgb.shape[:2])
                 models = getattr(self, "fitted_models", None)
                 model = models[index] if models and index < len(models) else None
+                withheld = getattr(self, "model_withheld", None)
+                if withheld and index < len(withheld) and withheld[index]:
+                    model = None                 # off the part on this frame; see check_carried_meshes()
                 if model is not None and model.fitted_pose is not None:
                     linear = getattr(model, "fitted_linear", None)
                     result.update(model_pose=(motion @ model.fitted_pose).tolist(),
@@ -1612,7 +2157,12 @@ class PoseServer:
                                   model_linear=(np.asarray(linear) if linear is not None
                                                 else model.fitted_scale * np.eye(3)).tolist(),
                                   model_quality=getattr(model, "fitted_quality", None) or "fit",
-                                  model_measured=bool(getattr(model, "fitted_measured", True)))
+                                  model_measured=bool(getattr(model, "fitted_measured", True)),
+                                  model_fit_id=getattr(model, "fitted_id", None))
+                    doubt = getattr(model, "fitted_spin_doubt", None)
+                    if doubt is not None:
+                        # Relative to the fit, so carried by the motion with it.
+                        result["model_spin_doubt"] = np.asarray(doubt).tolist()
                 surfaces = getattr(self, "surfaces", None)
                 if (surfaces and index < len(surfaces)
                         and (frame.id == 0 or frame.id % SURFACE_PUBLISH_EVERY == 0)):
@@ -1647,11 +2197,14 @@ class PoseServer:
         depth = decode_depth(parts[1], meta).astype(np.float32)
         K = np.asarray(meta["K"], dtype=np.float64).reshape(3, 3)
         depth_factor = float(meta["depth_factor"])
+        models = decode_models(meta, parts[2:], len(meta["points"]))
+        meta["points"], meta["labels"] = self.locate_unclicked(
+            rgb, depth / depth_factor, K, meta["points"], meta["labels"], models)
+        self.init_points = meta["points"]
         self.anchors = np.stack([
             anchor_from_points(points, labels, depth, K, depth_factor)
             for points, labels in zip(meta["points"], meta["labels"])
         ])
-        models = decode_models(meta, parts[2:], len(meta["points"]))
         specs = meta.get("models") or []
         required = [index < len(specs) and specs[index] is not None
                     for index in range(len(meta["points"]))]
@@ -1672,6 +2225,38 @@ class PoseServer:
         self.frame_id += 1
         return motions @ self.anchors, frame, motions
 
+    def locate_unclicked(self, rgb, metres, K, points, labels, models):
+        """Each object's click, made from its mesh where none was sent.
+
+        An object sent with an empty point list and a mesh is located in the
+        view by the mesh (locate_with_mesh()); clicked objects are kept as
+        they are, and no object is located on another's click.
+        """
+        if all(len(p) for p in points):
+            return points, labels
+        proposals = self.pipeline.propose_masks(rgb)
+        if proposals is None:
+            raise RuntimeError("the segmenter offers no mask proposals; click every object")
+        clicked = [p for pts, lbls in zip(points, labels)
+                   for p, label in zip(pts, lbls) if label]
+        taken = np.zeros(metres.shape, bool)
+        points, labels = list(points), list(labels)
+        started = time.time()
+        for index, pts in enumerate(points):
+            if len(pts):
+                continue
+            if models[index] is None:
+                raise ValueError(f"object {index}: no click and no usable mesh to locate it by")
+            click, region, note = locate_with_mesh(models[index], proposals, metres, K,
+                                                   clicked, taken)
+            if click is None:
+                raise ValueError(f"object {index}: not located by its mesh ({note}); click it")
+            taken |= region
+            points[index], labels[index] = click, [1] * len(click)
+            print(f"[server] object {index}: located by its mesh at {click} ({note})", flush=True)
+        print(f"[server] located by mesh in {time.time() - started:.1f} s", flush=True)
+        return points, labels
+
     def handle_track(self, meta, parts):
         if self.pipeline is None or self.anchors is None:
             raise RuntimeError("pipeline not initialized; send an 'init' request first")
@@ -1684,6 +2269,7 @@ class PoseServer:
             timestamp=meta.get("timestamp", time.time()),
         )
         motions = np.asarray(self.pipeline.step(frame), dtype=np.float64)
+        self.check_carried_meshes(motions, frame)
         self.retry_pending_meshes(motions, frame)
         if self.frame_id % SURFACE_EVERY == 0:
             self.record_surfaces(motions, frame)
@@ -1745,6 +2331,8 @@ class PoseServer:
                         "bboxes": bboxes,
                         "model_errors": self.model_errors,
                         "latency_ms": round((time.time() - t0) * 1000, 1),
+                        # The clicks used, those located by mesh among them.
+                        **({"points": self.init_points} if cmd == "init" else {}),
                     }
                 )
             except Exception as exc:

@@ -39,6 +39,10 @@ class Sam2RealTimeSegmenter(Segmenter):
         self.num_obj = 0
         self.tracking_started = False
         self.frame_count = 0
+        self._mask_generator = None
+        # Prompt grid of propose(): 16 is ~3x faster than 32 but can miss parts
+        # narrower than the grid spacing (image width / points_per_side).
+        self.propose_points_per_side = int(config.get("propose_points_per_side", 24))
 
     def add_input_object(self, points, labels):
         """
@@ -91,6 +95,26 @@ class Sam2RealTimeSegmenter(Segmenter):
                 labels=np.array(lbls, dtype=np.int32),
             )
         return video_res_masks
+
+    def propose(self, image, **amg_kwargs):
+        """
+        Class-agnostic mask proposals for `image` (SAM2 "segment everything"),
+        for picking an object without a click. Reuses the tracker's weights and
+        does not touch the tracking state.
+
+        Returns:
+            List[np.ndarray]: boolean [H, W] masks, largest first.
+        """
+        if self._mask_generator is None or amg_kwargs:
+            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+            params = {"points_per_side": self.propose_points_per_side, "pred_iou_thresh": 0.7,
+                      "stability_score_thresh": 0.9, **amg_kwargs}
+            self._mask_generator = SAM2AutomaticMaskGenerator(self.predictor, **params)
+        with torch.inference_mode():
+            records = self._mask_generator.generate(image)
+        records.sort(key=lambda r: -r["area"])
+        return [np.asarray(r["segmentation"], bool) for r in records]
 
     def initialize(self, image, mask=None):
         """
