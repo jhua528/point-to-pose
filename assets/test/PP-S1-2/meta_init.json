@@ -1,0 +1,46 @@
+{
+ "cmd": "init",
+ "K": [
+  348.0045527399691,
+  0.0,
+  320.5,
+  0.0,
+  348.0045527399691,
+  240.5,
+  0.0,
+  0.0,
+  1.0
+ ],
+ "depth_factor": 1.0,
+ "timestamp": 2257.772,
+ "points": [
+  [],
+  []
+ ],
+ "labels": [
+  [],
+  []
+ ],
+ "models": [
+  {
+   "vertices": 4240,
+   "faces": 6102
+  },
+  {
+   "vertices": 3567,
+   "faces": 5340
+  }
+ ],
+ "robot_mask": {
+  "shape": [
+   480,
+   640
+  ],
+  "bits": "eJzt2jFygkAUgGEdCkuPwFE4Gh6No3CElBaZmExSxVkK3j5x0e/r/QdGeLCuh8Mq/e3HvO4zm/cmvareRa+ql5fTS+h96VX1PvWa6l31mup96DXVm/XChjfsTXp6T+qNucsPPb1Vkpe/u+gl5lrvHfWa6nV6L9076VU5N94bc3u/4yWx1yX3Tm/WO+vpre0l/tze6+k9u5e4XaGn98ze8Ihe4v22i17i81JPb9e97v9mZXVvzO0d7zZTx8p5kN3r7nq3R/Qq5v3fevJOdq/i7wfFXsX2+SbHV9Hrkr+PTXp113NB671LM71jsTclH192bw73ivdbxUDI7p2LvfhAyO71xV58IGT3hmIvPmDKvfhAGLfpXaK9ci69NwVz5XGV35uDvfK4Cg+E8t0b7/VLveBAyO4NS73gQBiXesGBoKe3xrDUC17PenW9fqnXyPx7t172802vrV55dXQLv1/p1fWWXk+j78/pvevCOQd7AAAAAAAAAAAAAAAAAAAAAAAAAAAAwE58A0P9dgY="
+ },
+ "depth_enc": "raw_f32",
+ "depth_shape": [
+  480,
+  640
+ ]
+}

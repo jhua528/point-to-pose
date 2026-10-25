@@ -787,17 +787,21 @@ class FrontEnd:
         )
         info["relaxed_when_lost"] = bool(relax_when_lost)
 
-        if relax_when_lost:
-            # T_prev is frozen and stale, so the jump test carries no information.
-            # Gate on support alone, at a stricter inlier bar than normal tracking:
-            # re-acquiring should need more evidence than continuing, not less.
+        big_jump = (dt > self.pose_jump_guard_trans_thres) or (
+            ddeg > self.pose_jump_guard_rot_deg_thres
+        )
+        if relax_when_lost and big_jump:
+            # T_prev is frozen and stale, so a large jump from it may be a correct
+            # re-acquisition. Gate it on support alone, at a stricter inlier bar
+            # than normal tracking: re-acquiring should need more evidence than
+            # continuing, not less. A candidate that stays near the frozen pose
+            # takes the normal path below, which accepts small motion; gating it
+            # here too would make the relaxed guard stricter than the normal one
+            # and keep a sparsely tracked object lost forever.
             reject = (ninliers < self.pose_jump_guard_lost_min_inliers) or (
                 inlier_ratio < self.pose_jump_guard_lost_min_inlier_ratio
             )
         else:
-            big_jump = (dt > self.pose_jump_guard_trans_thres) or (
-                ddeg > self.pose_jump_guard_rot_deg_thres
-            )
             weak_support = (ninliers < self.pose_jump_guard_min_inliers) or (
                 inlier_ratio < self.pose_jump_guard_min_inlier_ratio
             )
@@ -812,7 +816,7 @@ class FrontEnd:
                 f"[FrontEnd] Pose jump guard rejected candidate "
                 f"(dT={dt:.3f}m, dR={ddeg:.2f}deg, "
                 f"inliers={ninliers}/{used}, clusters={num_clusters}"
-                f"{', relaxed-when-lost' if relax_when_lost else ''})."
+                f"{', relaxed-when-lost' if relax_when_lost and big_jump else ''})."
             )
             return T_prev, True, info
 

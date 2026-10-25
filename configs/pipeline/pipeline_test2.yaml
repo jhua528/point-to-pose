@@ -62,6 +62,10 @@ pipeline:
     max_lost_frames: 5
     pose_jump_guard_lost_min_inliers: 8
     pose_jump_guard_lost_min_inlier_ratio: 0.25
+    # Resume sampling after 3 guard-accepted frames even if `lost` stays set,
+    # so a sparsely tracked object can grow its points back instead of being
+    # stuck at the few it had (lost -> no sampling -> weak support deadlock).
+    sample_stabilize_frames: 3
 
 reconstructor:
   type: sdf_builder

@@ -62,6 +62,26 @@ def decode_depth(buf, meta):
     return cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
+def decode_robot_mask(meta, shape):
+    """The robot's pixels the client sent with an init, or None: meta
+    ["robot_mask"] holds the mask's shape and base64 of zlib of its
+    np.packbits(). One that cannot be read or is not the depth's size is
+    left out, and the proposals on the robot are fitted like any other."""
+    spec = meta.get("robot_mask")
+    if not spec:
+        return None
+    try:
+        h, w = (int(n) for n in spec["shape"])
+        if (h, w) != tuple(shape):
+            raise ValueError(f"{h}x{w} against a {shape[0]}x{shape[1]} depth")
+        bits = np.frombuffer(zlib.decompress(base64.b64decode(spec["bits"])), np.uint8)
+        return np.unpackbits(bits, count=h * w).reshape(h, w).astype(bool)
+    except Exception as exc:
+        print(f"[server] unusable robot mask ({exc}); proposals on the robot are fitted too",
+              flush=True)
+        return None
+
+
 def anchor_from_points(points, labels, depth, K, depth_factor, radius=3):
     """Object origin on the init frame: the clicked surface point in camera coordinates.
 
@@ -411,6 +431,21 @@ MODEL_ENDS_ELONGATION = 1.5
 MODEL_ENDS_COST_SLACK = 0.05
 MODEL_ENDS_MARGIN = 0.8
 MODEL_PROFILE_BINS = 16
+# The profile is of the depth points, and a probe lying along the table is
+# cut away with the support (PP-S1-2: ends kept, mismatch 0.04 against 0.05,
+# with the probe at the wrong end). The mask still holds it. So the mesh
+# points the two ends' poses do not share -- the probe, as each places it;
+# those farther than MODEL_ENDS_FEATURE_M from the other pose's points -- are
+# measured against the mask: the median distance, in metres at their depth,
+# from the seen ones to the nearest mask pixel. A distance rather than an
+# overlap, so a demonstration mesh's probe a few millimetres off still lands
+# near the probe the mask holds. Where the two poses' distances differ by
+# MODEL_ENDS_FEATURE_MARGIN_M, the nearer is taken whatever the profile says;
+# fewer than MODEL_ENDS_FEATURE_MIN such points seen in either pose, or
+# distances closer than that, leave it to the profile.
+MODEL_ENDS_FEATURE_M = 0.006
+MODEL_ENDS_FEATURE_MIN = 5
+MODEL_ENDS_FEATURE_MARGIN_M = 0.004
 # Which way round a long part is about its length. The tester's two long
 # sides differ only by its probe and the groove under it: with its lower
 # half behind PP-S4-1's occluder, the demonstration mesh turned half round
@@ -475,6 +510,46 @@ SURFACE_MAX_VOXELS = 6000
 SURFACE_MIN_SEEN = 2
 # Replies carry each object's surface this often (in frames), and on the first.
 SURFACE_PUBLISH_EVERY = 5
+
+# Published motions are smoothed: on a still scene the pipeline's pose hops
+# among a few near-equal registration solutions, ~1 cm and ~1 deg apart. Each
+# frame moves the published pose a fraction of the way to the new one, that
+# fraction growing with the step -- SMOOTH_MIN_ALPHA for a step well inside
+# SMOOTH_FULL_M / SMOOTH_FULL_DEG, all the way (no lag) for one past them, so
+# real motion is followed at once. Only the reply is smoothed; the meshes,
+# surfaces and the pipeline itself keep the raw motion. 1.0 turns it off.
+SMOOTH_MIN_ALPHA = 0.3
+SMOOTH_FULL_M = 0.03
+SMOOTH_FULL_DEG = 3.0
+
+
+class PoseSmoother:
+    def __init__(self):
+        self.last = None
+
+    def reset(self, motions=None):
+        self.last = None if motions is None else np.array(motions, dtype=np.float64)
+
+    def __call__(self, motions):
+        motions = np.asarray(motions, dtype=np.float64)
+        if (self.last is None or self.last.shape != motions.shape
+                or not np.all(np.isfinite(self.last))):
+            self.reset(motions)
+            return motions.copy()
+        out = motions.copy()
+        for index, (prev, cur) in enumerate(zip(self.last, motions)):
+            if not np.all(np.isfinite(cur)):
+                continue
+            dR = prev[:3, :3].T @ cur[:3, :3]
+            w = cv2.Rodrigues(dR)[0].ravel()
+            dt = cur[:3, 3] - prev[:3, 3]
+            step = max(np.linalg.norm(dt) / SMOOTH_FULL_M,
+                       np.degrees(np.linalg.norm(w)) / SMOOTH_FULL_DEG)
+            alpha = float(np.clip(step, SMOOTH_MIN_ALPHA, 1.0))
+            out[index, :3, :3] = prev[:3, :3] @ cv2.Rodrigues(alpha * w)[0]
+            out[index, :3, 3] = prev[:3, 3] + alpha * dt
+        self.last = out
+        return out.copy()
 
 
 class SurfaceMemory:
@@ -806,6 +881,7 @@ class _ModelFit:
         self.obs_tree = cKDTree(self.obs)
         self._obb_points = cam[obs_mask if use_foreground else keep]
         self._obb = None
+        self._mask_distance = None
 
     @property
     def obb(self):
@@ -1163,15 +1239,15 @@ class _ModelFit:
                 centre = R @ (self.linear(scale) @ self.model.box[:3, 3]) + t
         return R, t, terms, scale
 
-    def candidates(self):
+    def candidates(self, on_support=True):
         """Starting rotations: the mesh's box axes laid on the observed box's
         axes every way round, and -- the observed box tilts when part of the
-        object is hidden -- each box axis standing on the support surface at
-        a range of headings."""
+        object is hidden -- with `on_support`, each box axis standing on the
+        support surface at a range of headings."""
         box = self.model.box[:3, :3]
         R_obs, _, extent_obs = self.obb
         out = [R_obs @ P @ box.T for P in _signed_permutations()]
-        if self.plane is not None:
+        if on_support and self.plane is not None:
             up = -self.plane[0]
             major = R_obs[:, int(np.argmax(extent_obs))]
             x0 = major - (major @ up) * up
@@ -1361,14 +1437,47 @@ class _ModelFit:
                 or terms2["cost"] > terms["cost"] + MODEL_ENDS_COST_SLACK):
             return terms, R, t, scale, quality
         here, there = self.profile_mismatch(R, t, scale), self.profile_mismatch(R2, t2, scale)
-        if there < MODEL_ENDS_MARGIN * here:
-            terms2["scale_note"] = (terms.get("scale_note", "") + f"; turned end for end: profile "
-                                    f"mismatch {there:.2f} against {here:.2f}")
+        feature = self.feature_miss(R, t, R2, t2, scale)
+        if feature is not None and abs(feature[0] - feature[1]) > MODEL_ENDS_FEATURE_MARGIN_M:
+            turn = feature[1] < feature[0]
+            why = (f"feature {1000 * feature[turn]:.1f} mm off the mask against "
+                   f"{1000 * feature[not turn]:.1f} mm")
+        else:
+            turn = there < MODEL_ENDS_MARGIN * here
+            why = (f"profile mismatch {there:.2f} against {here:.2f}" if turn
+                   else f"profile mismatch {here:.2f} against {there:.2f}")
+            if feature is not None:
+                why += f" (feature {1000 * feature[0]:.1f} mm off the mask against {1000 * feature[1]:.1f} mm)"
+        if turn:
+            terms2["scale_note"] = terms.get("scale_note", "") + f"; turned end for end: {why}"
             terms2["measured"] = terms.get("measured", False)
             return terms2, R2, t2, scale, quality2
-        terms["scale_note"] = (terms.get("scale_note", "")
-                               + f"; ends kept: profile mismatch {here:.2f} against {there:.2f}")
+        terms["scale_note"] = terms.get("scale_note", "") + f"; ends kept: {why}"
         return terms, R, t, scale, quality
+
+    def feature_miss(self, R, t, R2, t2, scale):
+        """(here, there): how far the mask lies from the mesh points the two
+        poses do not share, as each pose places them, in metres; None where
+        either shows too few of them. See MODEL_ENDS_FEATURE_M."""
+        if self._mask_distance is None:
+            self._mask_distance = cv2.distanceTransform(
+                (~self.mask).astype(np.uint8), cv2.DIST_L2, 5)
+        M = self.linear(scale)
+        spacing = _overall(scale) * self.model.spacing
+        tol = max(MODEL_ENDS_FEATURE_M, 2 * spacing)
+        P = self.model.points @ (R @ M).T + t
+        P2 = self.model.points @ (R2 @ M).T + t2
+        h, w = self.depth.shape
+        out = []
+        for A, B in ((P, P2), (P2, P)):
+            own = cKDTree(B).query(A, distance_upper_bound=tol)[0] > tol
+            A = A[own & _seen_from_camera(A, self.K, spacing, self.depth.shape)]
+            if len(A) < MODEL_ENDS_FEATURE_MIN:
+                return None
+            uv = np.round(_pixels(A, self.K)).astype(np.int64)
+            u, v = np.clip(uv[:, 0], 0, w - 1), np.clip(uv[:, 1], 0, h - 1)
+            out.append(float(np.median(self._mask_distance[v, u] * A[:, 2] / self.K[0, 0])))
+        return tuple(out)
 
     def settle_spin(self, terms, R, t, scale, quality):
         """(terms, R, t, scale, quality, doubt): the pose, or the same turned
@@ -1607,39 +1716,82 @@ def carried_fit_rejection(model, pose, mask, metres, K):
 
 
 # Locating an object by its mesh, for an object sent with a mesh and no click.
-# SAM2 proposes every mask in the view. The mesh's box rules most of them out
-# by size and proportions, which is cheap; the mesh's pose fit
-# (fit_model_box()) then runs on the LOCATE_FITS likeliest, and the best fit's
-# visible surface, projected into the image, gives the click: points inside
-# the part, as a person would pick them. The click comes from the fitted mesh
-# rather than from the proposal, because a proposal can be a piece of the
-# part (the label on a can) that the mesh fits as well.
+# SAM2 proposes masks where its grid of prompt points falls, and the depth
+# image's regions (depth_proposals()) are proposed beside them. Those mostly
+# on the robot, as the client sends it, are not parts. The mesh's box rules
+# most of the rest out by size and proportions, which is cheap; each left is
+# fitted roughly (LOCATE_SCREEN), the LOCATE_FITS best of those properly
+# (_quick_fit()), and the best fit's visible surface, projected into the
+# image, gives the click: points inside the part, as a person would pick
+# them. The click comes from the fitted mesh rather than from the proposal,
+# because a proposal can be a piece of the part (the label on a can) that
+# the mesh fits as well.
+#
+# Proportions only rule out; they do not rank: a reconstruction's are not
+# the part's. RI-S1-1's bar, 340 x 27 mm, is seen 12.9 to 1 against the
+# mesh's 386 x 39, 9.8 to 1.
+#
+# SAM2 did propose RI-S1-1's bar, but its mask took in a row of the ground
+# behind it and was ruled out by its size (LOCATE_RATIO_SLACK). With the
+# arm's links taken as the robot's, the bar was then not located at all;
+# before, the bar's mesh, stretched, had taken the arm's upper link. Held in
+# the air, the bar stands 40 cm clear of the cart and more of the ground in
+# depth.
+#
+# A depth region is one where neighbouring pixels differ in depth by
+# MODEL_DEPTH_GAP_M at most (as connected_depth_foreground() joins them), or
+# by this share of their depth: a surface seen edge-on steps further a row
+# the further away it is, and the ground beyond the bench, 17 cm a row at
+# 10 m, came out a region per row. A part standing clear of what is behind
+# it comes out whole, one resting on the bench is part of the bench's region
+# and left to SAM2. Regions smaller than LOCATE_DEPTH_MIN_PX are the depth's
+# speckle. A SAM2 mask with LOCATE_DEPTH_SAME_IOU with a region is that
+# region, but for its edge's spill onto what is behind -- SAM2's bar took in
+# the row of ground under it, 3.2 m further -- and the region is taken in
+# its place.
+LOCATE_DEPTH_GAP_SHARE = 0.03
+LOCATE_DEPTH_MIN_PX = 100
+LOCATE_DEPTH_SAME_IOU = 0.8
 #
 # A proposal's area, in square metres at its depth, against the mesh's
 # smallest and largest face at the ends of MODEL_SCALE_RANGE, these factors
 # beyond: the bench, a wall, a speck are out.
 LOCATE_AREA_SLACK = (0.25, 1.5)
 # One view of a box shows two of its extents. The proposal's two longest
-# must be in the proportions of one such pair of the mesh's, within this.
-LOCATE_RATIO_SLACK = 1.6
+# must be in the proportions of one such pair of the mesh's, within what the
+# fit may stretch it to: each axis MODEL_STRETCH_MAX either way. At 1.6 the
+# simulated bar, 337 x 21 mm seen from one side, missed the mesh's 9.8 to 1
+# by 1.61. The box is of the proposal's main depth component, as the fit
+# takes it (connected_depth_foreground()): left in, the few pixels of SAM2's
+# bar mask on the ground 3.2 m behind it made a box 988 x 334 mm.
+LOCATE_RATIO_SLACK = MODEL_STRETCH_MAX ** 2
 # Points of a proposal's surface its box is fit to; min_obb() of every pixel
 # of a large proposal costs more than the rest of the screening together.
 LOCATE_BOX_POINTS = 2000
-LOCATE_FITS = 4
-# A proposal this much inside an object already located is that object.
+# The rough fit: mesh points, observed points and ICP rounds, at the
+# observed box's axes only -- about 1 s a proposal against 10 s for the
+# proper fit. At most LOCATE_SCREENS proposals, nearest the mesh's
+# proportions first, keep the init within the client's allowance.
+LOCATE_SCREEN = (500, 300, 4)
+LOCATE_SCREENS = 24
+LOCATE_FITS = 2
+# A proposal this much inside an object already located is that object;
+# this much on the robot, the robot.
 LOCATE_TAKEN_SHARE = 0.5
 # Points per click, kept this far inside the visible surface's edge.
 LOCATE_PROMPTS = 3
 LOCATE_EDGE_PX = 4
 
 
-def _quick_fit(model, view, K):
+def _quick_fit(model, view, K, screen=False):
     """The mesh's pose on one proposal, for telling proposals apart: the
     coarse stage of _ModelFit.run(), its best start refined, and nothing of
     the scale measuring after (fit_boxes() fits the chosen one in full).
     Returns (score, (R, t, scale)) or None: a pose the coarse acceptance
     takes over one it does not, then its share of the observed points on
     the mesh less its share seen through or pressed into what is there.
+    With `screen`, the rough fit that ranks proposals (LOCATE_SCREEN): the
+    starts at the observed box's axes only, and no refining.
 
     The observed size is always among the starts. Nothing here measures the
     scale, and a mesh some 25 % off the part's size, within
@@ -1648,23 +1800,24 @@ def _quick_fit(model, view, K):
     rim onto the background behind (contradiction 0.37), and the ring was
     not located on its own mask; at the observed size, 0.14."""
     fit = _ModelFit(model, view, K, np.random.default_rng(0))
-    mesh_n, obs_n, rounds = MODEL_COARSE
+    mesh_n, obs_n, rounds = LOCATE_SCREEN if screen else MODEL_COARSE
     starts = fit.start_scales()
     observed = float(np.clip(np.sort(fit.obb[2])[1] / np.sort(model.extent)[1], *MODEL_SCALE_RANGE))
     if not any(np.ndim(s) == 0 and np.isclose(s, observed) for s in starts):
         starts.append(observed)
     best = None
     for s in starts:
-        for R in fit.candidates():
+        for R in fit.candidates(on_support=not screen):
             t = fit.place(s, R, mesh_n)
             R, t, terms = fit.icp(s, R, t, rounds, mesh_n, obs_n, MODEL_SEARCH_M)
             if terms is not None and (best is None or terms["cost"] < best[0]):
-                best = (terms["cost"], R, t, s)
+                best = (terms["cost"], R, t, s, terms)
     if best is None:
         return None
-    _, R, t, s = best
-    R, t, terms = fit.icp(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS,
-                          2 * MODEL_TOL_M)
+    _, R, t, s, terms = best
+    if not screen:
+        R, t, terms = fit.icp(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS,
+                              2 * MODEL_TOL_M)
     if terms is None:
         return None
     return ((not model_pose_rejection(terms, coarse=True),
@@ -1707,11 +1860,45 @@ def mesh_click(model, R, t, scale, metres, K):
     return [[int(c), int(r)] for r, c in points], region > 0
 
 
-def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None):
+def depth_proposals(metres):
+    """The depth image's regions as masks, of LOCATE_DEPTH_MIN_PX or more."""
+    valid = np.isfinite(metres) & (metres > 0)
+    count = int(valid.sum())
+    if not count:
+        return []
+    z = np.where(valid, metres, 0.0)
+    indices = np.full(metres.shape, -1, dtype=np.int32)
+    indices[valid] = np.arange(count)
+    sources, targets = [], []
+    for a, b in ((np.s_[:-1, :], np.s_[1:, :]), (np.s_[:, :-1], np.s_[:, 1:])):
+        gap = np.maximum(MODEL_DEPTH_GAP_M, LOCATE_DEPTH_GAP_SHARE * np.maximum(z[a], z[b]))
+        linked = valid[a] & valid[b] & (np.abs(z[a] - z[b]) <= gap)
+        sources.append(indices[a][linked])
+        targets.append(indices[b][linked])
+    sources, targets = np.concatenate(sources), np.concatenate(targets)
+    graph = coo_matrix((np.ones(len(sources), dtype=np.uint8), (sources, targets)), shape=(count, count))
+    _, labels = connected_components(graph, directed=False)
+    regions = np.full(metres.shape, -1, dtype=np.int64)
+    regions[valid] = labels
+    return [regions == label for label in np.flatnonzero(np.bincount(labels) >= LOCATE_DEPTH_MIN_PX)]
+
+
+def describe_proposal(mask):
+    """Where a proposal is, for the server's log."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return "empty"
+    return f"{len(ys)} px, u {xs.min()}-{xs.max()} v {ys.min()}-{ys.max()}"
+
+
+def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None, robot=None, why=None):
     """Where in the view an object is, by its mesh: (click, region, note),
     the click as mesh_click() gives it and the model fitted, or
     (None, None, reason). `clicked` are pixels of other objects, `taken` the
-    regions of those already located; proposals on them are skipped."""
+    regions of those already located, `robot` the robot's pixels; proposals
+    on them are skipped. `why`, a list, is given (index, what became of it)
+    for each proposal."""
+    why = [] if why is None else why
     f = float(K[0, 0])
     m = np.sort(model.extent)[::-1]
     low, high = MODEL_SCALE_RANGE
@@ -1722,52 +1909,98 @@ def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None):
     clicked = [(min(max(int(round(v)), 0), h - 1), min(max(int(round(u)), 0), w - 1))
                for u, v in clicked]
     valid = np.isfinite(metres) & (metres > 0)
-    rng = np.random.default_rng(0)
-    shortlist = []
-    for mask in proposals:
+    shortlist, on_robot = [], 0
+    for index, mask in enumerate(proposals):
         if any(mask[r, c] for r, c in clicked):
+            why.append((index, "on another object's click"))
             continue
         if taken is not None and (mask & taken).sum() > LOCATE_TAKEN_SHARE * mask.sum():
+            why.append((index, "an object already located"))
             continue
+        if robot is not None:
+            if (mask & robot).sum() > LOCATE_TAKEN_SHARE * mask.sum():
+                on_robot += 1
+                why.append((index, f"{(mask & robot).sum() / mask.sum():.0%} on the robot"))
+                continue
+            # What of the robot it does take in is still not the part.
+            mask = mask & ~robot
         z = metres[mask & valid]
         if len(z) < MIN_BOX_POINTS:
+            why.append((index, f"{len(z)} depth points"))
             continue
-        if not area_range[0] <= mask.sum() * (np.median(z) / f) ** 2 <= area_range[1]:
+        area = mask.sum() * (np.median(z) / f) ** 2
+        if not area_range[0] <= area <= area_range[1]:
+            why.append((index, f"{area * 1e4:.3g} cm2, not {area_range[0] * 1e4:.2g}-"
+                               f"{area_range[1] * 1e4:.0f}"))
             continue
         try:
             view = observe(mask, metres, K)
-        except Exception:
+        except Exception as exc:
+            why.append((index, f"not observed ({exc})"))
             continue
         if view is None or view[2].sum() < MIN_BOX_POINTS:
+            why.append((index, "too few points off its support"))
             continue
-        surface = view[0][view[2]]
-        surface = surface[rng.permutation(len(surface))[:LOCATE_BOX_POINTS]]
+        cam = view[0]
+        surface = cam[connected_depth_foreground(view[2], cam[..., 2], cam)]
+        # Its own draw, so a proposal's box does not depend on those before it.
+        surface = surface[np.random.default_rng(0).permutation(len(surface))[:LOCATE_BOX_POINTS]]
         e = np.sort(min_obb(surface)[2])[::-1]
         if not low * m[2] <= e[0] <= high * m[0]:
+            why.append((index, f"{e[0] * 1000:.0f} mm long, not {low * m[2] * 1000:.0f}-"
+                               f"{high * m[0] * 1000:.0f}"))
             continue
         miss = float(np.min(np.abs(np.log(e[0] / max(e[1], 1e-4)) - pairs)))
-        if miss <= np.log(LOCATE_RATIO_SLACK):
-            shortlist.append((miss, view))
+        if miss > np.log(LOCATE_RATIO_SLACK):
+            why.append((index, f"{e[0] * 1000:.0f} x {e[1] * 1000:.0f} mm, proportions "
+                               f"x{np.exp(miss):.2f} off the mesh's"))
+            continue
+        shortlist.append((miss, index, view))
     if not shortlist:
-        return None, None, f"none of {len(proposals)} proposals is the mesh's size and shape"
+        return None, None, (f"none of {len(proposals)} proposals ({on_robot} on the robot) "
+                            f"is the mesh's size and shape")
+    screened = []
+    for rank, (_, index, view) in enumerate(sorted(shortlist, key=lambda item: item[0])):
+        if rank >= LOCATE_SCREENS:
+            why.append((index, "shortlisted, past the screening cap"))
+            continue
+        try:
+            found = _quick_fit(model, view, K, screen=True)
+        except Exception:
+            traceback.print_exc()
+            found = None
+        if found is None:
+            why.append((index, "shortlisted, no rough fit"))
+            continue
+        screened.append((found[0], index, view))
+    screened.sort(key=lambda item: item[0], reverse=True)
     best, tried = None, 0
-    for _, view in sorted(shortlist, key=lambda item: item[0])[:LOCATE_FITS]:
+    for rank, ((accepted, rough), index, view) in enumerate(screened):
+        said = f"rough fit {rough:.2f}" + ("" if accepted else " refused")
+        if rank >= LOCATE_FITS:
+            why.append((index, said))
+            continue
         tried += 1
         try:
             found = _quick_fit(model, view, K)
         except Exception:
             traceback.print_exc()
+            found = None
+        if found is None:
+            why.append((index, f"{said}, no fit"))
             continue
-        if found is not None and (best is None or found[0] > best[0]):
+        why.append((index, f"{said}, fit {found[0][1]:.2f}" + ("" if found[0][0] else " refused")))
+        if best is None or found[0] > best[0]:
             best = found
     if best is None or not best[0][0]:
-        return None, None, f"the mesh fits none of {tried} likely proposals"
+        return None, None, (f"the mesh fits none of {tried} likely proposals "
+                            f"({on_robot} on the robot)")
     (_, score), pose = best
     found = mesh_click(model, *pose, metres, K)
     if found is None:
         return None, None, "the fitted mesh shows no surface in the view"
-    note = (f"score {score:.2f}, best of {tried} fitted of {len(shortlist)} "
-            f"shortlisted of {len(proposals)} proposals")
+    note = (f"score {score:.2f}, best of {tried} fitted of {len(screened)} screened of "
+            f"{len(shortlist)} shortlisted of {len(proposals)} proposals, {on_robot} on the robot")
     return found[0], found[1], note
 
 
@@ -1856,6 +2089,7 @@ class PoseServer:
         self.mesh_fit_job = None
         self.mesh_session = 0
         self.surfaces = []
+        self.smoother = PoseSmoother()
 
         self.ctx = zmq.Context()
         self.sock = self.ctx.socket(zmq.REP)
@@ -1872,6 +2106,7 @@ class PoseServer:
         self.model_required = None
         self.model_errors = None
         self.bbox_warned = False
+        self.smoother.reset()
 
     def fit_boxes(self, rgb, metres, K, points, labels, models, model_required=None):
         """Each object's box on the init frame, fit to its mask; None where it cannot be.
@@ -2199,7 +2434,8 @@ class PoseServer:
         depth_factor = float(meta["depth_factor"])
         models = decode_models(meta, parts[2:], len(meta["points"]))
         meta["points"], meta["labels"] = self.locate_unclicked(
-            rgb, depth / depth_factor, K, meta["points"], meta["labels"], models)
+            rgb, depth / depth_factor, K, meta["points"], meta["labels"], models,
+            decode_robot_mask(meta, depth.shape))
         self.init_points = meta["points"]
         self.anchors = np.stack([
             anchor_from_points(points, labels, depth, K, depth_factor)
@@ -2222,33 +2458,58 @@ class PoseServer:
         motions = np.asarray(self.pipeline.step(frame), dtype=np.float64)
         self.surfaces = [SurfaceMemory() for _ in meta["points"]]
         self.record_surfaces(motions, frame)
+        self.smoother.reset(motions)
         self.frame_id += 1
         return motions @ self.anchors, frame, motions
 
-    def locate_unclicked(self, rgb, metres, K, points, labels, models):
+    def locate_unclicked(self, rgb, metres, K, points, labels, models, robot=None):
         """Each object's click, made from its mesh where none was sent.
 
         An object sent with an empty point list and a mesh is located in the
         view by the mesh (locate_with_mesh()); clicked objects are kept as
-        they are, and no object is located on another's click.
+        they are, no object is located on another's click, and none on
+        `robot`, the robot's pixels as the client sees them.
         """
         if all(len(p) for p in points):
             return points, labels
-        proposals = self.pipeline.propose_masks(rgb)
-        if proposals is None:
+        started = time.time()
+        sam = self.pipeline.propose_masks(rgb)
+        if sam is None:
             raise RuntimeError("the segmenter offers no mask proposals; click every object")
+        sam = list(sam)
+        regions = depth_proposals(metres)
+        proposals, sources, as_region = [], [], 0
+        for which, mask in enumerate(sam):
+            same = [k for k, region in enumerate(regions)
+                    if (mask & region).sum() > LOCATE_DEPTH_SAME_IOU * (mask | region).sum()]
+            if same:
+                proposals.append(regions.pop(same[0]))
+                sources.append(f"SAM2 proposal {which} as its depth region")
+                as_region += 1
+            else:
+                proposals.append(mask)
+                sources.append(f"SAM2 proposal {which}")
+        proposals += regions
+        sources += [f"depth region {k}" for k in range(len(regions))]
         clicked = [p for pts, lbls in zip(points, labels)
                    for p, label in zip(pts, lbls) if label]
         taken = np.zeros(metres.shape, bool)
         points, labels = list(points), list(labels)
-        started = time.time()
+        print(f"[server] {len(sam)} SAM2 proposals ({as_region} taken as their depth region), "
+              f"{len(regions)} more from depth; "
+              + (f"robot on {int(robot.sum())} px" if robot is not None else "robot not sent"),
+              flush=True)
         for index, pts in enumerate(points):
             if len(pts):
                 continue
             if models[index] is None:
                 raise ValueError(f"object {index}: no click and no usable mesh to locate it by")
+            why = []
             click, region, note = locate_with_mesh(models[index], proposals, metres, K,
-                                                   clicked, taken)
+                                                   clicked, taken, robot, why)
+            for which, said in sorted(why):
+                print(f"[server]   object {index}, {sources[which]} "
+                      f"({describe_proposal(proposals[which])}): {said}", flush=True)
             if click is None:
                 raise ValueError(f"object {index}: not located by its mesh ({note}); click it")
             taken |= region
@@ -2274,6 +2535,7 @@ class PoseServer:
         if self.frame_id % SURFACE_EVERY == 0:
             self.record_surfaces(motions, frame)
         self.frame_id += 1
+        motions = self.smoother(motions)
         return motions @ self.anchors, frame, motions
 
     def handle_preview(self, meta, parts):
