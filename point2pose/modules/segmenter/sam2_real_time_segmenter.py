@@ -43,6 +43,8 @@ class Sam2RealTimeSegmenter(Segmenter):
         # Prompt grid of propose(): 16 is ~3x faster than 32 but can miss parts
         # narrower than the grid spacing (image width / points_per_side).
         self.propose_points_per_side = int(config.get("propose_points_per_side", 24))
+        # Tracked masks made exclusive (see _non_overlapping()).
+        self.non_overlapping = bool(config.get("non_overlapping", True))
 
     def add_input_object(self, points, labels):
         """
@@ -239,7 +241,23 @@ class Sam2RealTimeSegmenter(Segmenter):
         """
         out_obj_ids, out_mask_logits = self.predictor.track(image)
         self.frame_count += 1
+        if self.non_overlapping:
+            out_mask_logits = self._non_overlapping(out_mask_logits)
         return out_obj_ids, out_mask_logits
+
+    @staticmethod
+    def _non_overlapping(logits):
+        """Each pixel to one object at most: where several objects' masks
+        claim it, only the one SAM2 is surest of (the highest logit) keeps
+        it. SAM2 tracks each object on its own, and a mask can take in a
+        part touching it: RR-S1-1's bar's took in 649 of the 777 px of the
+        ring round it, and the bar's points sampled there would follow the
+        ring, not the bar, as it slid along."""
+        if logits is None or logits.shape[0] < 2:
+            return logits
+        best = logits.argmax(dim=0, keepdim=True)
+        mine = torch.arange(logits.shape[0], device=logits.device).view(-1, 1, 1, 1) == best
+        return torch.where(mine | (logits <= 0), logits, torch.full_like(logits, -1.0))
 
     def _add_all_points_to_predictor(self) -> bool:
         """

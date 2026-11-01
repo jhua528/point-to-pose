@@ -1,0 +1,46 @@
+{
+ "cmd": "init",
+ "K": [
+  348.0045527399691,
+  0.0,
+  320.5,
+  0.0,
+  348.0045527399691,
+  240.5,
+  0.0,
+  0.0,
+  1.0
+ ],
+ "depth_factor": 1.0,
+ "timestamp": 326.987,
+ "points": [
+  [],
+  []
+ ],
+ "labels": [
+  [],
+  []
+ ],
+ "models": [
+  {
+   "vertices": 4240,
+   "faces": 6102
+  },
+  {
+   "vertices": 23536,
+   "faces": 44366
+  }
+ ],
+ "robot_mask": {
+  "shape": [
+   480,
+   640
+  ],
+  "bits": "eJzt2j1ug0AQQGEQBV04AkfZK6VMtxyNk0R7gUgpI8XOj+008Q6WPTPgBb9XbsQXEvBgjKtKqP0+NuQ/6Q/rSdrmUr/e5+9240KesL6s16zbGxTe3tOrT15aqXcr5+5V/t6ucO9r2vu63YuzeO+eXvT0wiVvt0UvuXrV4ZD4emHS+9B6woZ419ZPHg9h+ToveXqtvzd6eo2/l2RPWL6DV6/SC1v2hBMtaN4+n8LbthelC0XQ3C5c8CLe/TzhjZnBC2v0VLe/6/B66XzR3V7O4nULeLXBa4XjYfPyG9Oy9u/Z2XvJ1hqTlx9fm5f//7bsdTtvLz9fWsvfu89fHxavfnP2vPdP8DqLJ8wXk7fLvWjwqnz/juPF0WtsXrZl+2BeV5QXi/eGB/POV46e4uP2U+H1fKW3eSNeSV6fnL3R1xN+w8HTPa7AwyvOC3N4jq+3VXjq6yUe3sa85v8zBrMXfb3zZ1zROA+8vebM+57DM8z7v+89/s/b0339YNrTPT5fbv8MXuN8PBbxbOezUOneUIxXi97ovH/eXlJ74uvNMBC8vU709APB2+tFTz8QvL0gevoBI3v6gRCX8QatJ3Pu3qjk5HHl7yWlJ48r9UB4mji8hgHTi573QPAeWPqBIHv6gYBXlidfgEv39Oczns2TJ7R+XuHN4emvb6V78juOR/MS3rUt4o3b9YiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIhoBf0ADA1PSA=="
+ },
+ "depth_enc": "raw_f32",
+ "depth_shape": [
+  480,
+  640
+ ]
+}

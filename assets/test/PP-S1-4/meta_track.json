@@ -1,0 +1,28 @@
+{
+ "cmd": "track",
+ "K": [
+  348.0045527399691,
+  0.0,
+  320.5,
+  0.0,
+  348.0045527399691,
+  240.5,
+  0.0,
+  0.0,
+  1.0
+ ],
+ "depth_factor": 1.0,
+ "timestamp": 311.666,
+ "robot_mask": {
+  "shape": [
+   480,
+   640
+  ],
+  "bits": "eJzt2kFSg0AQQFEoFiw5AkeZK7l0NxyNk1hzAatcWmU0msSNmZ5U0t3Bgfy/xOJJBBqQNI1Qvz825T8ZD8uTtM6lfryPn/XmhTxh+bJet25vUnifnl578tJKvVs5d6/x93aVe19l7+t2L97Fe/P0oqcXLnm7LXrJ1WsOu8TXC0XvXesJK+Jd21jcH8Li67zk6fX+3uzpdf5ekj1h8T947Sq9sGVPONCC5vb5FN62vShdKILmceGCF/H+zxNuzAxeWKOnevxdhzdKx4vu8fIu3rCA1xq8XtgfNi9/MK1r+56cvedsWWfy8v1r8/K/35a9Yeft5cdLb/m8n/n5YfHaV2fPe/sEb7B4wnwxebvciwavybfvOF4cvc7mZWv2D+YNVXmxem96MO98ydFT/Lv9VHg5XzLavBmvJm9Mzt7s6wm/4eDpXlfg4VXnhXt4jufbKjz19RIPb2Ne9/cdg9mLvt75O65onAfeXnfm7e/hGeb97/ce/+bt6b5+UPZ0r8+X2z6D1znvj0U82/EsVLs3VeO1ojc7b5+3l9SeeL4ZBoK3N4iefiB4e6Po6QeCtxdETz9gZE8/EOIy3qT1ZM7dm5WcPK78vaT05HGlHgjy2av3xpKnHAjeXih5yoEQS55yIODh3VIoecrjGc/mjSWvkvn3aJ739Q2vLk9+Otqr76/wbF7p9lR7/+zuvbdJ/MxKj4iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIhW0jf/Fbwe"
+ },
+ "depth_enc": "raw_f32",
+ "depth_shape": [
+  480,
+  640
+ ]
+}

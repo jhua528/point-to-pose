@@ -12,7 +12,7 @@
   1.0
  ],
  "depth_factor": 1.0,
- "timestamp": 2257.772,
+ "timestamp": 296.414,
  "points": [
   [],
   []
@@ -27,8 +27,8 @@
    "faces": 6102
   },
   {
-   "vertices": 3567,
-   "faces": 5340
+   "vertices": 23536,
+   "faces": 44366
   }
  ],
  "robot_mask": {
@@ -36,7 +36,7 @@
    480,
    640
   ],
-  "bits": "eJzt2jFygkAUgGEdCkuPwFE4Gh6No3CElBaZmExSxVkK3j5x0e/r/QdGeLCuh8Mq/e3HvO4zm/cmvareRa+ql5fTS+h96VX1PvWa6l31mup96DXVm/XChjfsTXp6T+qNucsPPb1Vkpe/u+gl5lrvHfWa6nV6L9076VU5N94bc3u/4yWx1yX3Tm/WO+vpre0l/tze6+k9u5e4XaGn98ze8Ihe4v22i17i81JPb9e97v9mZXVvzO0d7zZTx8p5kN3r7nq3R/Qq5v3fevJOdq/i7wfFXsX2+SbHV9Hrkr+PTXp113NB671LM71jsTclH192bw73ivdbxUDI7p2LvfhAyO71xV58IGT3hmIvPmDKvfhAGLfpXaK9ci69NwVz5XGV35uDvfK4Cg+E8t0b7/VLveBAyO4NS73gQBiXesGBoKe3xrDUC17PenW9fqnXyPx7t172802vrV55dXQLv1/p1fWWXk+j78/pvevCOQd7AAAAAAAAAAAAAAAAAAAAAAAAAAAAwE58A0P9dgY="
+  "bits": "eJzt2k1Sg0AQQGEoFiw5AkeZK7l0NxyNk1hcwCqXVonG/LhJpieVdHdwIO8tsfgkAg1Iqkqo3R0b0p/0h+WTtM619t7Xfr1xIU9YvqzXrNsbFN63p1efvGml3r2cu1f5e3Ph3k/e+7nfiw/xPjy96OmFa968RW9y9arDLvH1Qtb71HrCini31mf3h7D4Nm/y9Fp/b/T0Gn9vkj1h8T949Sq9sGVPONCC5vb5FN62vShdKILmceGKF/H+zxNuzAxeWKOnevxdh9dLx4vu8fIhXreAVxu8VtgfNi99MC1r+16cvddkWWPy0v1r89K/35a9bvb20uOltXze7/T8sHj1u7PnvX2C11k8Yb6YvDn1osGr0u07jhdHr7F5yZrtk3ldUV4s3huezLtccvQU/24/Fd4ul/Q2b8QryesnZ2/09YTfcPB0ryvw8IrzwiM8x/NtFZ76eomHtzGvOX/HYPair3f5jisa54G311x4u0d4hnn/973H87w93dcP8p7u9fly22fwGuf9sYhnO56FSveGYrxa9Ebn7fP2JrUnnm+GgeDtdaKnHwjeXi96+oHg7QXR0w8Y2dMPhLiMN2g9mXP3RiUnjyt/b1J68rhSDwT57NV7fc5TDgRvL+Q85UCIOU85EPDw7inkPOXxjGfz+pxXyPx7Ns/7+oZXlic/He3U91d4Ni93e6q9f3b3PjOfWekRERERERERERERERERERERERERERERERERERERERERERERERERERERERER0Ur6BRQvuz0="
  },
  "depth_enc": "raw_f32",
  "depth_shape": [

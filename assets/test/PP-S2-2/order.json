@@ -1,0 +1,22 @@
+{
+ "init": [
+  "meta_init.json",
+  "rgb.jpg",
+  "depth.f32.zlib",
+  "mesh_tester.f32i32.zlib",
+  "mesh_sample.f32i32.zlib"
+ ],
+ "track": [
+  "meta_track.json",
+  "rgb.jpg",
+  "depth.f32.zlib"
+ ],
+ "objects": [
+  "tester",
+  "sample"
+ ],
+ "meshes": {
+  "tester": "/root/TM5-900/agent/knowledge/demos/pick_placement/model/obj_1/mid_files/scaled_mesh.obj",
+  "sample": "/root/TM5-900/agent/knowledge/demos/pick_placement/model/obj_2/mid_files/scaled_mesh.obj"
+ }
+}

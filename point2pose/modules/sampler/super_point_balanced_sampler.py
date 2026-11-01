@@ -25,6 +25,12 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
         self.density_per_kpx = float(config.get("density_per_kpx", -1.0))
         self.min_points = int(config.get("min_points", 5))
         self.max_points = int(config.get("max_points", max(self.num_points, 5)))
+        # Points spanning less than this share of the mask's length are topped
+        # up with its silhouette corners too (see sample()).
+        self.min_spread = float(config.get("min_spread", 0.5))
+        # A fill corner's least structure-tensor eigenvalue over its largest
+        # at least this (see _fill_with_corners()).
+        self.fill_corner_min_ratio = float(config.get("fill_corner_min_ratio", 0.15))
         self.round_mode = str(config.get("round_mode", "round")).lower()
 
         # Candidate preprocessing.
@@ -65,9 +71,31 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
                 print(
                     f"[SuperPoint Balanced] Retrying obj {obj_id} with edge margin {margin}px"
                 )
-        if best.shape[0] < self.min_points:
+        # Enough points can still all sit in one spot: PP-S4-1's sample plate
+        # got 6, all within a few pixels by its notch, and registration on
+        # them turned the plate 13 deg and moved it 10 cm with 0.6 mm residual.
+        if best.shape[0] < self.min_points or self._clustered(context, obj_id, best):
             best = self._fill_with_corners(context, obj_id, best)
         return best
+
+    def _clustered(self, context: SamplerContext, obj_id: int, pts) -> bool:
+        """Whether the points span less than min_spread of the object's mask
+        along either of its principal axes (2nd to 98th percentile of its
+        pixels): bunched in one spot, or in a line -- PP-S1-2's sample got 5
+        points along its length, 11 mm across its 61, and every registration
+        on them after the second frame came out a metre off."""
+        if self.min_spread <= 0 or pts.shape[0] == 0:
+            return pts.shape[0] == 0
+        mask = (context.frame.mask[obj_id, 0] > 0).cpu().numpy()
+        ys, xs = np.nonzero(mask)
+        if len(xs) < 3:
+            return False
+        px = np.column_stack([xs, ys]).astype(np.float64)
+        centre = px.mean(0)
+        axes = np.linalg.eigh(np.cov((px - centre).T))[1]
+        lo, hi = np.percentile((px - centre) @ axes, [2, 98], axis=0)
+        along = (pts.astype(np.float64) - centre) @ axes
+        return bool(np.any(np.ptp(along, axis=0) < self.min_spread * (hi - lo)))
 
     def _fill_with_corners(self, context: SamplerContext, obj_id: int, pts):
         """
@@ -91,11 +119,22 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
         if corners is None:
             return pts
         cand = np.round(corners.reshape(-1, 2)).astype(np.int32)
+        # A corner, not a point on an edge: an edge point slides along the
+        # edge when tracked. Shi-Tomasi's quality is relative to the mask's
+        # strongest corner, so a round part, with none, still yields points:
+        # all of RI-S4-2's ring's came out 0.01-0.07 here, a plate's corners
+        # 0.26-0.63, and topped up so, the ring turned 57 deg on one frame.
+        if self.fill_corner_min_ratio > 0 and len(cand):
+            ev = cv.cornerEigenValsAndVecs(gray, 5, 3)[cand[:, 1], cand[:, 0], :2]
+            ratio = ev.min(1) / np.maximum(ev.max(1), 1e-9)
+            cand = cand[ratio >= self.fill_corner_min_ratio]
         depth = getattr(frame, "depth", None)
         if depth is not None:
             depth = depth.detach().cpu().numpy() if torch.is_tensor(depth) else np.asarray(depth)
             d = depth[cand[:, 1], cand[:, 0]]
             cand = cand[np.isfinite(d) & (d > 0)]
+            cand = cand[[not self._at_occluder(depth, mask, c, getattr(frame, "depth_factor", None))
+                         for c in cand]] if len(cand) else cand
         chosen = [p for p in pts.astype(np.int32)]
         # Points already tracked on this object count for spacing, not for output.
         existing = self._collect_existing_points_local(context, obj_id, mask, False, 0, 0)
@@ -118,6 +157,23 @@ class SuperPointBalancedSampler(SuperPointFPSSampler):
             f"topped up to {len(out)} with silhouette corners"
         )
         return out
+
+    @staticmethod
+    def _at_occluder(depth, mask, corner, depth_factor, radius=4, nearer_m=0.02):
+        """Whether a silhouette corner is where something in front cuts the
+        object off: off the mask within `radius` px, something `nearer_m`
+        nearer. Such a corner is the occluder's, and slides along its edge:
+        RI-S4-2's ring, half behind the box, was topped up with corners on
+        the box's edge and turned 54 deg on the first frame. A plate's own
+        corners have the table behind them, further."""
+        h, w = depth.shape
+        x, y = int(corner[0]), int(corner[1])
+        window = np.s_[max(y - radius, 0):y + radius + 1, max(x - radius, 0):x + radius + 1]
+        scale = float(depth_factor) if depth_factor else 1.0
+        here = depth[y, x] / scale
+        around = depth[window] / scale
+        outside = (mask[window] == 0) & np.isfinite(around) & (around > 0)
+        return bool(np.any(around[outside] < here - nearer_m))
 
     def _sample_with_margin(self, context: SamplerContext, obj_id: int, margin: int):
         frame = context.frame
