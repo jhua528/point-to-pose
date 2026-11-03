@@ -674,6 +674,24 @@ MODEL_SCALE_MAX_HIDDEN = 0.5
 # smaller one. A mesh that is the part's size so keeps exactly 1, which the
 # agent's demonstration grasps require of a native mesh pose.
 MODEL_SCALE_MIN_GAIN = 0.03
+# A part's shape -- its scale along each of its mesh's box axes -- measured on
+# an earlier view (LOCATE_KNOWN_SCALES) is fitted on each later one too, once
+# that view's own fit has settled which way round the part lies, about its
+# centre, and kept unless the view's own shape costs this much less: a rigid
+# part's size is its own, whichever side it shows. Turned over in
+# PP-S3-2 (2026-11-02), the tester showed the camera its underside, which the
+# reconstruction has only roughly; its fit came out 154-158 mm long of 182,
+# measured, both ends seen, its centre 12 mm along its length off the part's,
+# and the placement carried that: four runs 14-15 mm off. On that view the
+# shape measured upright cost less (0.473 against 0.490; p95 6.0 mm against
+# 9.5) and was 1 mm off along its length, but no start of the pose search was
+# near it. Not before the ends are settled: the probe under the body, at the
+# full length no test saw it, and the colour and the mask turned the part
+# end for end, 20 mm off. Nor with MODEL_SCALE_MIN_GAIN's lean to the shape
+# held, the lower cost deciding, as between the pose search's starts: first
+# seen turned over, the tester held its 154 mm on the upright view after,
+# 0.467 against its own 0.441, and would have held it from then on.
+MODEL_KNOWN_SHAPE_MIN_GAIN = 0.0
 # A part hidden more than MODEL_SCALE_MAX_HIDDEN whose fit passes the coarse
 # acceptance neither at its start nor at the other parts' scale is fitted once
 # more at the scale, along its box axes, it was located at this init: the
@@ -1184,12 +1202,14 @@ class _ModelFit:
     """Fits one mesh to one object's view; see fit_model_box()."""
 
     def __init__(self, model, view, K, rng, through=None, scale_hint=None, ignore=None, located=None,
-                 image=None):
+                 image=None, known_shape=None):
         cam, mask, keep, plane, _ = view
         # The frame's grey levels, for what the depth does not show (end_streak()).
         self.gray = None if image is None else cv2.cvtColor(np.asarray(image, np.uint8),
                                                             cv2.COLOR_RGB2GRAY).astype(np.float64)
         self.scale_hint = scale_hint
+        # The part's shape measured on earlier views (MODEL_KNOWN_SHAPE_MIN_GAIN).
+        self.known_shape = None if known_shape is None else np.asarray(known_shape, np.float64).reshape(3)
         # The scale, along the mesh's box axes, it was located at this init
         # (MODEL_LOCATED_FALLBACK).
         self.located = located
@@ -1283,6 +1303,37 @@ class _ModelFit:
         if per_axis and np.ndim(raised):
             return R2, t2, moved, raised, note + f"; raised to {_describe(raised)} to cover what was seen"
         return R2, t2, moved, raised, note + f"; raised {factor:.2f} times to cover what was seen"
+
+    def known_shape_fit(self, terms, R, t, scale, quality):
+        """(terms, R, t, scale, quality): the pose, its ends and its turn
+        about its length settled, at the shape measured on earlier views
+        (known_shape), fitted about this one's centre, where it costs no more
+        than MODEL_KNOWN_SHAPE_MIN_GAIN over this one and fits as well -- then
+        measured, by those views; else this one."""
+        known = self.known_shape
+        if np.allclose(np.broadcast_to(np.asarray(scale, np.float64), (3,)), known,
+                       rtol=MODEL_SCALE_FINE_RATIO - 1):
+            return terms, R, t, scale, quality
+        mean = self.model.points.mean(0)
+        centre = R @ (self.linear(scale) @ mean) + t
+        Rk, tk, k_terms = self.icp(known, R, centre - R @ (self.linear(known) @ mean), MODEL_FINE_ROUNDS,
+                                   MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * MODEL_TOL_M)
+        if k_terms is None:
+            return terms, R, t, scale, quality
+        Rk, tk, k_terms, _ = self.polish(known, Rk, tk, k_terms)
+        k_quality = ("fit" if not model_pose_rejection(k_terms)
+                     else "coarse" if not model_pose_rejection(k_terms, coarse=True) else None)
+        costs = f"{k_terms['cost']:.3f} against {terms['cost']:.3f} at {_describe(scale)}"
+        rank = {"fit": 2, "coarse": 1, None: 0}
+        if k_terms["cost"] > terms["cost"] + MODEL_KNOWN_SHAPE_MIN_GAIN or rank[k_quality] < rank[quality]:
+            terms["scale_note"] = terms.get("scale_note", "") + (f"; the size measured before, "
+                                                                 f"{_describe(known)}, fits worse: {costs}")
+            terms["known_shape"] = "beaten"
+            return terms, R, t, scale, quality
+        k_terms["measured"], k_terms["known_shape"] = True, "kept"
+        k_terms["scale_note"] = (terms.get("scale_note", "")
+                                 + f"; kept the size measured before, {_describe(known)}: {costs}")
+        return k_terms, Rk, tk, known, k_quality
 
     def axes_seen(self, R, t, scale, ends=True):
         """Per mesh box axis, whether the view shows the part's length along
@@ -2444,7 +2495,7 @@ def model_pose_rejection(terms, coarse=False):
 
 
 def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, ignore=None, located=None,
-                  image=None):
+                  image=None, known_shape=None):
     """Box of one object from its mesh: ((T_cam_box, extent, note), None) if
     the mesh fits the view, (None, reason) if not.
 
@@ -2453,12 +2504,17 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, ignor
     comment above MODEL_SAMPLES). Its box then goes where the mesh went, at
     the mesh's size whatever share of the object was in view. `ignore`, the
     robot's and the other parts' pixels, is no evidence of which end the
-    part sticks out of (MODEL_ENDS_STICK_MIN_M).
+    part sticks out of (MODEL_ENDS_STICK_MIN_M). `known_shape`, the part's
+    scales along the mesh's box axes measured on earlier views, is kept
+    where this view's own costs no less (MODEL_KNOWN_SHAPE_MIN_GAIN);
+    model.fitted_known_shape says "kept", or "beaten" by this view's.
     """
     model.fitted_pose = model.fitted_scale = model.fitted_linear = None
     model.fitted_quality, model.fitted_measured = None, False
     model.fitted_spin_doubt = model.fitted_ends_doubt = model.fitted_id = None
-    fit = _ModelFit(model, view, K, rng or np.random.default_rng(0), through, scale_hint, ignore, located, image)
+    model.fitted_known_shape = None
+    fit = _ModelFit(model, view, K, rng or np.random.default_rng(0), through, scale_hint, ignore, located, image,
+                    known_shape)
     result = fit.run()
     if result is None:
         return None, "no pose left any mesh point in view"
@@ -2467,6 +2523,14 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, ignor
     doubt = None
     if quality is not None:
         terms, R, t, scale, quality, doubt = fit.settle_spin(terms, R, t, scale, quality)
+    if ends_other is not None:
+        # Relative to the pose, as the spin's doubt is, before the shape
+        # measured before moves it (MODEL_KNOWN_SHAPE_MIN_GAIN).
+        settled = np.eye(4)
+        settled[:3, :3], settled[:3, 3] = R, t
+        ends_other = np.linalg.inv(settled) @ ends_other
+    if quality is not None and fit.known_shape is not None:
+        terms, R, t, scale, quality = fit.known_shape_fit(terms, R, t, scale, quality)
     stats = (f"fitness {terms['fitness']:.2f}, contradiction {terms['contradiction']:.2f}, "
              f"penetration {terms['penetration']:.2f}, {terms['hidden']:.0%} hidden "
              f"({terms['unmasked']:.0%} outside the mask at the mesh's depth), "
@@ -2486,15 +2550,16 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, ignor
     model.fitted_scale = _overall(scale)
     model.fitted_linear = M
     model.fitted_quality, model.fitted_measured = quality, bool(terms["measured"])
+    model.fitted_known_shape = terms.get("known_shape")
     model.fitted_spin_doubt, model.fitted_id = doubt, uuid.uuid4().hex
-    model.fitted_ends_doubt = None if ends_other is None else np.linalg.inv(model.fitted_pose) @ ends_other
+    model.fitted_ends_doubt = ends_other
     label = ("mesh pose fit" if quality == "fit"
              else f"coarse mesh pose fit ({model_pose_rejection(terms)})")
     return (T, np.broadcast_to(scale, (3,)) * model.extent, f"{label}, {stats}"), None
 
 
 def retry_mesh_fit(model, mask, metres, K, through=None, scale_hint=None, ignore=None, located=None,
-                   image=None):
+                   image=None, known_shape=None):
     """Worker owns its model state and frame snapshot, never the live pipeline."""
     model = copy.copy(model)
     try:
@@ -2502,7 +2567,7 @@ def retry_mesh_fit(model, mask, metres, K, through=None, scale_hint=None, ignore
         if view is None:
             return None, "insufficient current depth", model
         fit, reason = fit_model_box(model, view, K, through=through, scale_hint=scale_hint, ignore=ignore,
-                                    located=located, image=image)
+                                    located=located, image=image, known_shape=known_shape)
         return fit, reason, model
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}", model
@@ -2700,10 +2765,16 @@ LOCATE_REST_SHARE = 0.2
 LOCATE_SCALE_AGREE = 1.5
 # A mesh's scale is its reconstruction's, the same from scene to scene: the
 # ring measured 0.870-0.915 in RI-S1-1 to RR-S1-1. So the server keeps each
-# mesh's measured scales -- fine fits whose size the view showed, the last
-# LOCATE_KNOWN_SCALES by the mesh's id, for as long as it runs -- and a part
-# too hidden to measure its own size (MODEL_SCALE_MAX_HIDDEN) takes their
-# median (fit_model_box()'s scale_hint) before the other parts' scale. Not
+# mesh's measured shapes -- the scales along its box axes of fine fits whose
+# size the view showed, not one an earlier view's gave
+# (MODEL_KNOWN_SHAPE_MIN_GAIN), the last LOCATE_KNOWN_SCALES by the mesh's id,
+# for as long as it runs; one that fitted its view better than theirs takes
+# their place, not a median of the two that no view measured (the tester
+# first seen turned over, 154 mm, then upright, 181: 167 mm, 8 mm off on the
+# view turned over after). Every fit tries their median, axis by axis
+# (fit_model_box()'s known_shape), and a part too hidden to measure its own
+# size (MODEL_SCALE_MAX_HIDDEN) takes its overall size (fit_model_box()'s
+# scale_hint) before the other parts' scale. Not
 # to rule out where a part is located: a part half hidden is located at the
 # scale of what shows -- PP-S4-2's tester, behind the box, at 1.83 of its
 # 2.49 -- as far off as the box's latch was located as the ring (0.66 of
@@ -3408,9 +3479,11 @@ class PoseServer:
         self.sent_model_poses = [None] * len(points)          # see held_turn()
         # Each part's hint: the other located parts' scale, for a part too
         # hidden to measure its own (MODEL_SCALE_MAX_HIDDEN).
-        # Its own measured scale first (LOCATE_KNOWN_SCALES).
+        # Its own measured scale first (LOCATE_KNOWN_SCALES), and its shape
+        # tried on every view (MODEL_KNOWN_SHAPE_MIN_GAIN).
         scales = getattr(self, "locate_scales", {})
         self.scale_hints = []
+        self.shape_hints = [self.known_shape(model) for model in models]
         for index in range(len(points)):
             hint = self.known_scale(models[index])
             others = [s for j, s in scales.items() if j != index]
@@ -3467,7 +3540,7 @@ class PoseServer:
                         fit, reason = fit_model_box(models[index], view, K, through=cut[index],
                                                     scale_hint=self.scale_hints[index], ignore=ignore,
                                                     located=getattr(self, "locate_shapes", {}).get(index),
-                                                    image=rgb)
+                                                    image=rgb, known_shape=self.shape_hints[index])
                     except Exception as exc:
                         traceback.print_exc()
                         reason = f"{type(exc).__name__}: {exc}"
@@ -3598,7 +3671,8 @@ class PoseServer:
             future = self.mesh_fit_executor.submit(
                 retry_mesh_fit, self.models[index], mask, metres, np.array(frame.intrinsics, copy=True),
                 others_region(index, regions), self.scale_hints[index], ignore,
-                getattr(self, "locate_shapes", {}).get(index), np.array(frame.rgb, copy=True))
+                getattr(self, "locate_shapes", {}).get(index), np.array(frame.rgb, copy=True),
+                self.known_shape(self.models[index]))
             self.mesh_fit_job = (future, index, self.mesh_session, capture_inverse)
             print(f"[server] object {index}: retrying mesh pose on frame {frame.id}", flush=True)
         except Exception as exc:
@@ -3815,18 +3889,28 @@ class PoseServer:
         return out
 
     def remember_scale(self, model):
-        """Keep a fine fit's scale where the view measured it; see LOCATE_KNOWN_SCALES."""
-        if model is None or model.fitted_quality != "fit" or not model.fitted_measured:
+        """Keep a fine fit's shape, its scales along its mesh's box axes, where
+        the view measured it: with those measured before, or in their place
+        where it fitted the view better than they did; not where theirs was
+        kept. See LOCATE_KNOWN_SCALES."""
+        how = getattr(model, "fitted_known_shape", None)
+        if model is None or model.fitted_quality != "fit" or not model.fitted_measured or how == "kept":
             return
         known = getattr(self, "known_scales", None)
         if known is None:
             known = self.known_scales = {}
-        known[model.model_id] = (known.get(model.model_id, []) + [float(model.fitted_scale)])[-LOCATE_KNOWN_SCALES:]
+        before = [] if how == "beaten" else known.get(model.model_id, [])
+        known[model.model_id] = (before + [fitted_axis_scale(model).tolist()])[-LOCATE_KNOWN_SCALES:]
+
+    def known_shape(self, model):
+        """The median, axis by axis, of a mesh's measured shapes, or None."""
+        shapes = (getattr(self, "known_scales", None) or {}).get(getattr(model, "model_id", None))
+        return np.median(np.asarray(shapes, np.float64).reshape(-1, 3), axis=0) if shapes else None
 
     def known_scale(self, model):
-        """The median of a mesh's measured scales, or None."""
-        scales = (getattr(self, "known_scales", None) or {}).get(getattr(model, "model_id", None))
-        return float(np.median(scales)) if scales else None
+        """The overall size of a mesh's measured shape, or None."""
+        shape = self.known_shape(model)
+        return None if shape is None else _overall(shape)
 
     def held_turn(self, index, model, pose):
         """(turn, axis): the turn of the fitted mesh at `pose` about the axis
