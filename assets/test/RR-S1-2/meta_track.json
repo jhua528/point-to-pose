@@ -12,7 +12,8 @@
   1.0
  ],
  "depth_factor": 1.0,
- "timestamp": 2468.121,
+ "timestamp": 190.392,
+ "timeout_ms": 15000,
  "robot_mask": {
   "shape": [
    480,

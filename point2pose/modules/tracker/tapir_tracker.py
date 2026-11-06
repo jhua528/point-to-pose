@@ -63,6 +63,13 @@ class TapirTracker(Tracker):
         self._model.load_state_dict(torch.load(checkpoint_path))
         self._model = self._model.to(self._device)
         self._model = self._model.eval()
+        # Grad mode is per thread: this turns it off only on the thread that
+        # builds the tracker. pose_server's track thread had it on, so each
+        # keyframe's add_query_points() kept its feature grids' whole autograd
+        # graph (~720 MiB a keyframe), and released pipelines did not free it
+        # (2026-11-06: 7.9 GB held). Parameters that need no grad build no graph
+        # on any thread.
+        self._model.requires_grad_(False)
         torch.set_grad_enabled(False)
 
         # model related variables

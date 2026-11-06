@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 import zlib
 from xml.etree import ElementTree
@@ -31,6 +32,64 @@ from visualization_msgs.msg import Marker, MarkerArray
 from yolo_msgs.msg import BoundingBox3D
 
 BBOX_TOPIC = "/point2pose/bboxes"
+# Where the server cannot locate an object by its mesh for sure -- it fits no
+# place, only weakly, or several places about as well (pose_server's
+# NeedClick) -- the person is asked to click it: the request goes out on
+# CLICK_REQUEST_TOPIC (JSON: {"objects": [names], "why": {name: why},
+# "candidates": {name: [click, ...]}, "frame_id", "stamp"}, a click a list of
+# [u, v] pixels), with the frame it was asked on, candidates numbered from 0,
+# on CLICK_REQUEST_IMAGE_TOPIC. The answer comes on CLICK_TOPIC, one object a
+# message: {"object": name, "points": [[u, v], ...]} (labels 1, or "labels"),
+# or {"object": name, "candidate": k}. No init is sent until every object asked
+# for is answered; then one is, with every object's click -- those the server
+# was sure of as it located them -- and nothing is located by mesh.
+CLICK_REQUEST_TOPIC = "/point2pose/click_request"
+CLICK_REQUEST_IMAGE_TOPIC = "/point2pose/click_request/image"
+CLICK_TOPIC = "/point2pose/click"
+# Which way round a mesh lies on its part (pose_sever's Binding) goes with its
+# pose on /detected/<name>_model as "binding": "single" (nothing in doubt),
+# "ambiguous" or "locked", by what ("evidence", "support", "person"), each way
+# round still living -- its id, its turn relative to the pose, its probability
+# -- and those ruled out, and why. The views settle it as the part turns; a
+# doubt need not be settled to act, though, where it changes nothing done:
+# with --grasps, each object's grasps (4x4, the gripper in the mesh's frame
+# and units) are tried on every way round living, and a grasp that puts the
+# gripper within --grasp-tolerance-mm / -deg of where it puts it on the pose
+# published -- or turned half round about --grasp-flip-axis of it, a parallel
+# gripper's -- is safe to take now ("grasps_safe", their indices). Where the
+# doubt matters, the person is asked which way round (--ask-binding: "needed",
+# for an object none of whose grasps is safe or that has none given;
+# "always"; "never"): on BINDING_REQUEST_TOPIC (JSON: {"object", "fit_id",
+# "hypotheses": [{"id", "p"}]}), the frame on BINDING_REQUEST_IMAGE_TOPIC with
+# each way round's telling features -- where it has what the others have not
+# -- drawn in its colour and number. Tracking goes on meanwhile; the views may
+# settle it first, and the request is then withdrawn ({"object", "withdrawn":
+# true}). The answer comes on BINDING_TOPIC: {"object": name, "hypothesis":
+# id or number}, or {"object": name, "points": [[u, v], ...]} clicked on the
+# part's telling feature -- the way round whose features lie nearest them --
+# and goes to the server with the next frame (meta["bind"]).
+BINDING_REQUEST_TOPIC = "/point2pose/binding_request"
+BINDING_REQUEST_IMAGE_TOPIC = "/point2pose/binding_request/image"
+BINDING_TOPIC = "/point2pose/binding"
+# One asker of the person: a node publishing on BINDING_ASKER_TOPIC -- the
+# Agent, which puts its own way-round questions to the person, of the doubts
+# its task meets, after looking at the camera's view itself -- asks; while
+# one does, this client asks none of its own (but with --ask-binding always),
+# the same doubt else asked twice in two ways. It still keeps every way round
+# in doubt as asked (binding_asked), unshown, so that the answers that come on
+# BINDING_TOPIC are taken. An answer may say whose it is, {"by": "person" /
+# "camera" / "robot"}, sent on to the server with it (meta["bind"]); "person"
+# where it does not.
+BINDING_ASKER_TOPIC = "/point2pose/binding_asker"
+# The robot's pose of a part it set down, from whoever knows it (the agent):
+# {"object": name, "pose": 4x4, the mesh's pose in the world as
+# /detected/<name>_model gives it, "source": e.g. "robot_set_down"} on
+# POSE_PRIOR_TOPIC. Sent to the server with the next frame, in the camera's
+# frame (meta["priors"]), where it is one more way the part may lie, scored
+# with the fit's (pose_sever's MODEL_CHECK_FAILS); what came of it is in the
+# model message's "prior".
+POSE_PRIOR_TOPIC = "/point2pose/pose_prior"
+BINDING_COLOURS = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 128, 255), (128, 255, 0), (255, 128, 128)]
 # Box edges as corner-index pairs; the server orders corners so bit 0/1/2 of the
 # index flips x/y/z, hence edges join indices that differ in exactly one bit.
 BOX_EDGES = [(i, i | 1 << k) for i in range(8) for k in range(3) if not i >> k & 1]
@@ -117,13 +176,15 @@ OBSTACLE_PREFIX = "obstacle_"
 OBSTACLE_SIDE_TIE = 0.1
 
 
-def read_obj(path):
-    """Vertices (float32, metres) and triangles (int32) of an OBJ mesh.
+def read_obj(path, colours=False):
+    """Vertices (float32, metres) and triangles (int32) of an OBJ mesh; with
+    `colours`, also each vertex's RGB (uint8), or None unless every v line
+    carries one after its position ("v x y z r g b", 0-1 or 0-255).
 
     Only v and f lines matter; polygons are fanned into triangles, and face
     indices may carry /texture/normal parts or count back from the end.
     """
-    vertices, faces = [], []
+    vertices, faces, rgb = [], [], []
     with open(path, encoding="utf-8") as stream:
         for line in stream:
             fields = line.split("#", 1)[0].split()
@@ -131,6 +192,8 @@ def read_obj(path):
                 continue
             if fields[0] == "v":
                 vertices.append([float(x) for x in fields[1:4]])
+                if len(fields) >= 7:
+                    rgb.append([float(x) for x in fields[4:7]])
             elif fields[0] == "f":
                 ids = [int(x.split("/")[0]) for x in fields[1:]]
                 ids = [i - 1 if i > 0 else len(vertices) + i for i in ids]
@@ -138,7 +201,22 @@ def read_obj(path):
     v, f = np.asarray(vertices, np.float32), np.asarray(faces, np.int32)
     if v.ndim != 2 or v.shape[1] != 3 or not len(f) or f.min() < 0 or f.max() >= len(v):
         raise ValueError(f"{path}: no usable vertices and faces")
-    return v, f
+    if not colours:
+        return v, f
+    c = None
+    if len(rgb) == len(v):
+        c = np.asarray(rgb, np.float64)
+        c = np.clip(np.round(c * 255 if c.max() <= 1.0 else c), 0, 255).astype(np.uint8)
+    return v, f, c
+
+
+def rigid(value):
+    """`value` as a 4x4 rigid transform (nested lists), or None if it is not one."""
+    T = np.asarray(value if value is not None else np.nan, dtype=float)
+    if (T.shape == (4, 4) and np.isfinite(T).all() and np.allclose(T[3], [0, 0, 0, 1], atol=1e-6)
+            and np.allclose(T[:3, :3].T @ T[:3, :3], np.eye(3), atol=1e-5) and np.linalg.det(T[:3, :3]) > 0):
+        return T.tolist()
+    return None
 
 
 def upright_box(rotation, extent):
@@ -271,6 +349,33 @@ def encode_mask(mask):
             "bits": base64.b64encode(zlib.compress(np.packbits(mask).tobytes())).decode("ascii")}
 
 
+def safe_grasps(grasps, linear, turns, tol_m, tol_deg, flip_axis=None):
+    """Indices of `grasps` (4x4, the gripper in the mesh's frame and units)
+    that every way round in `turns` (4x4 relative to the pose published, in
+    the fitted mesh's frame) puts within `tol_m` and `tol_deg` of where the
+    pose published puts them -- or turned half round about `flip_axis` (in
+    the gripper's frame) of it."""
+    linear = np.asarray(linear, dtype=float)
+    flip = None if flip_axis is None else Rotation.from_rotvec(np.pi * np.asarray(flip_axis, float)).as_matrix()
+    out = []
+    for i, G in enumerate(grasps):
+        G = np.asarray(G, dtype=float).copy()
+        G[:3, 3] = linear @ G[:3, 3]
+        ok = True
+        for D in turns:
+            H = np.asarray(D, dtype=float) @ G
+            turn = G[:3, :3].T @ H[:3, :3]
+            angles = [np.linalg.norm(Rotation.from_matrix(turn).as_rotvec())]
+            if flip is not None:
+                angles.append(np.linalg.norm(Rotation.from_matrix(turn @ flip).as_rotvec()))
+            if np.linalg.norm(H[:3, 3] - G[:3, 3]) > tol_m or np.degrees(min(angles)) > tol_deg:
+                ok = False
+                break
+        if ok:
+            out.append(i)
+    return out
+
+
 def box_corners(T, extent):
     """The 8 corners of a box of `extent` at pose T, bit 0/1/2 of the index
     flipping x/y/z (BOX_EDGES)."""
@@ -358,6 +463,9 @@ class PoseClient(Node):
         self.relocate_failures, self.relocate_retry_at = 0, 0.0
         # (time, both fingertips in contact) of the last tactile reading.
         self.tactile = None
+        # The clicks asked for (ask_for_clicks()): {"points", "labels", "asked",
+        # "candidates", "shape"}, None while nothing is asked.
+        self.awaiting_clicks = None
         # The obstacles found, by name, and their publishers, made as they
         # are first found (OBSTACLE_PREFIX); the box rotation each was last
         # published with (OBSTACLE_SIDE_TIE).
@@ -378,6 +486,20 @@ class PoseClient(Node):
         sync = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.05)
         sync.registerCallback(self.on_frame)
         self.create_subscription(String, TACTILE_TOPIC, self.on_tactile, 10)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.click_request_pub = self.create_publisher(String, CLICK_REQUEST_TOPIC, latched)
+        self.click_image_pub = self.create_publisher(Image, CLICK_REQUEST_IMAGE_TOPIC, latched)
+        self.create_subscription(String, CLICK_TOPIC, self.on_click, 10)
+        # Ways round asked about, by name ({"fit_id", "ids", "features"}), and
+        # the answers to send with the next frame, by object index; see
+        # BINDING_REQUEST_TOPIC.
+        self.binding_asked, self.binding_answers = {}, {}
+        # Pose priors to send with the next frame, by name: (world pose, source).
+        self.pose_priors = {}
+        self.create_subscription(String, POSE_PRIOR_TOPIC, self.on_pose_prior, 10)
+        self.binding_request_pub = self.create_publisher(String, BINDING_REQUEST_TOPIC, latched)
+        self.binding_image_pub = self.create_publisher(Image, BINDING_REQUEST_IMAGE_TOPIC, latched)
+        self.create_subscription(String, BINDING_TOPIC, self.on_binding, 10)
 
         self.pub = self.create_publisher(PoseArray, "/point2pose/poses", 10)
         self.bbox_pub = self.create_publisher(MarkerArray, BBOX_TOPIC, 10)
@@ -512,9 +634,15 @@ class PoseClient(Node):
                 meta["models"].append(None)
                 continue
             vertices, faces = self.models[name]
+            colours = self.args.model_colours.get(name)
             meta["models"].append({"vertices": len(vertices), "faces": len(faces)})
+            if self.args.true_size_meshes:
+                meta["models"][-1]["known_scale"] = 1.0
+            if colours is not None:
+                meta["models"][-1]["colours"] = True
             frames.append(zlib.compress(vertices.astype("<f4").tobytes()
-                                        + faces.astype("<i4").tobytes()))
+                                        + faces.astype("<i4").tobytes()
+                                        + (b"" if colours is None else colours.tobytes())))
         return frames
 
     def request(self, meta, rgb, depth, extra=()):
@@ -552,6 +680,12 @@ class PoseClient(Node):
             return
         if self.relocation_waits(now):
             return
+        if self.awaiting_clicks is not None:
+            waiting = [name for name in self.awaiting_clicks["asked"] if self.awaiting_clicks["points"][
+                self.object_names.index(name)] is None]
+            self.get_logger().info(f"waiting for a click on {', '.join(waiting)} ({CLICK_TOPIC})",
+                                   throttle_duration_sec=10.0)
+            return
 
         rgb = self.bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
         depth = self.bridge.imgmsg_to_cv2(depth_msg, "passthrough")
@@ -569,12 +703,24 @@ class PoseClient(Node):
         }
         extra = ()
         if self.initialized:
+            # How long this client waits: the server answers within part of
+            # it, stale where the frame is not done (pose_sever's
+            # SERVER_REPLY_SHARE), so the socket is not reset under it.
+            meta["timeout_ms"] = self.args.timeout_ms
             # The robot on every frame too: the server takes it out of the
             # parts' masks, where a gripper on or by a part would be read as
             # the part (pose_sever's without_robot()).
             robot = self.robot_mask(depth.astype(np.float64) / depth_factor, rgb_msg.header.frame_id)
             if robot is not None:
                 meta["robot_mask"] = encode_mask(robot)
+            # The robot's poses of parts it set down (POSE_PRIOR_TOPIC), in this camera.
+            priors = self.camera_priors(rgb_msg.header.frame_id)
+            if priors:
+                meta["priors"] = priors
+            # The person's ways round (BINDING_TOPIC), until a reply takes them.
+            if self.binding_answers:
+                meta["bind"] = [{"object": index, "hypothesis": ident, "by": by}
+                                for index, (ident, by) in self.binding_answers.items()]
         if not self.initialized:
             meta["points"], meta["labels"] = self.relocate_points or (json.loads(self.args.points),
                                                                        json.loads(self.args.labels))
@@ -586,6 +732,7 @@ class PoseClient(Node):
                 return
             extra = self.mesh_frames(meta)
             meta["discover"] = self.args.obstacles
+            meta["same_scale_meshes"] = self.args.same_scale_meshes
             robot_note = "not known"
             if robot is not None:
                 meta["robot_mask"] = encode_mask(robot)
@@ -608,13 +755,29 @@ class PoseClient(Node):
         # how long each took; the same lines as its own console.
         for line in reply.get("init_report") or []:
             self.get_logger().info(f"server: {line}")
+        if not reply.get("ok") and reply.get("need_click") and meta["cmd"] == "init":
+            self._invalidate_all()
+            self.ask_for_clicks(reply, rgb, rgb_msg.header)
+            return
         if not reply.get("ok"):
             self._invalidate_all()
             self.get_logger().error(f"server error: {reply.get('error')}")
             self.relocation_failed()
             return
+        stale = reply.get("stale")
+        if isinstance(stale, dict) and meta["cmd"] == "track":
+            # The server is still on an earlier frame: these are that frame's
+            # poses, already published; nothing new to publish, nor to reset.
+            self.get_logger().warn(
+                f"server still working on frame {stale.get('working_on')} ({stale.get('busy_s')} s); "
+                f"no new poses this frame", throttle_duration_sec=2.0)
+            return
         if not self.initialized:
             self.initialized = True
+            # Ways round asked of an earlier init are no longer the server's.
+            for name in list(self.binding_asked):
+                self.withdraw_binding(name)
+            self.binding_answers = {}
             self.relocate_points = None
             self.relocate_by_mesh, self.relocate_carried = [], {}
             self.relocate_failures = 0
@@ -646,6 +809,11 @@ class PoseClient(Node):
         # Apply mesh recognition validity before publishing even the raw array:
         # an anchor tracked after a failed mesh fit is not an object pose.
         self.update_boxes(poses, lost, reply.get("bboxes"))
+        if meta.get("bind"):
+            self.binding_answers = {}
+        if meta.get("priors"):
+            self.pose_priors = {}
+        self.ask_binding(reply.get("bboxes"), rgb, rgb_msg.header)
         self.say_mesh_changes(reply.get("model_errors"))
         out = PoseArray()
         out.header = rgb_msg.header
@@ -680,6 +848,225 @@ class PoseClient(Node):
                                                   rgb_msg.header.frame_id, moving=True),
                           reply.get("bboxes"), depth.astype(np.float64) / depth_factor,
                           rgb_msg.header.frame_id)
+
+    def ask_for_clicks(self, reply, rgb, header):
+        """The server's need_click (CLICK_REQUEST_TOPIC): the objects it could
+        not locate for sure wait for the person's click (on_click()), the
+        others keep the clicks it located them at."""
+        sure = reply.get("points") or []
+        sent, sent_labels = json.loads(self.args.points), json.loads(self.args.labels)
+        points, labels = [], []
+        for index in range(len(self.object_names)):
+            # Where it was located, else as sent (no click: located again).
+            click = sure[index] if index < len(sure) and sure[index] else None
+            points.append(click if click else sent[index])
+            labels.append([1] * len(click) if click else sent_labels[index])
+        asked, why, candidates = [], {}, {}
+        for request in reply["need_click"]:
+            index = int(request["object"])
+            if not 0 <= index < len(self.object_names):
+                continue
+            name = self.object_names[index]
+            points[index] = labels[index] = None
+            asked.append(name)
+            why[name] = str(request.get("why", ""))
+            candidates[name] = [c for c in (request.get("candidates") or []) if isinstance(c, list) and c]
+        self.awaiting_clicks = {"points": points, "labels": labels, "asked": asked, "candidates": candidates,
+                                "shape": rgb.shape[:2]}
+        self.click_request_pub.publish(String(data=json.dumps({
+            "objects": asked, "why": why, "candidates": candidates,
+            "frame_id": header.frame_id, "stamp": header.stamp.sec + header.stamp.nanosec * 1e-9})))
+        shown = rgb.copy()
+        for name in asked:
+            for k, click in enumerate(candidates[name]):
+                for u, v in click:
+                    cv2.circle(shown, (int(u), int(v)), 4, (0, 255, 255), -1, cv2.LINE_AA)
+                u, v = np.asarray(click, dtype=float).mean(0)
+                cv2.putText(shown, f"{name} #{k}", (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(shown, f"{name} #{k}", (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 255), 1, cv2.LINE_AA)
+        image = self.bridge.cv2_to_imgmsg(shown, "bgr8")
+        image.header = header
+        self.click_image_pub.publish(image)
+        for name in asked:
+            self.get_logger().warn(
+                f"{name}: the server is not sure where it is ({why[name]}); click it: publish "
+                f"{{\"object\": \"{name}\", \"points\": [[u, v]]}} or {{\"object\": \"{name}\", \"candidate\": k}} "
+                f"on {CLICK_TOPIC} ({len(candidates[name])} candidates on {CLICK_REQUEST_IMAGE_TOPIC})")
+
+    def on_click(self, msg):
+        """A click asked for (ask_for_clicks()); with every one in, the init is
+        sent again with them all."""
+        wait = self.awaiting_clicks
+        try:
+            answer = json.loads(msg.data)
+            name = answer["object"]
+            if wait is None or name not in wait["asked"]:
+                self.get_logger().warn(f"click on {name}: none asked for")
+                return
+            if "candidate" in answer:
+                points = wait["candidates"][name][int(answer["candidate"])]
+            else:
+                points = [[float(u), float(v)] for u, v in answer["points"]]
+            labels = [int(x) for x in answer.get("labels", [1] * len(points))]
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            self.get_logger().error(f"unusable click on {CLICK_TOPIC}: {exc}")
+            return
+        h, w = wait["shape"]
+        if (not points or len(labels) != len(points) or not any(labels)
+                or not all(0 <= u < w and 0 <= v < h for u, v in points)):
+            self.get_logger().error(f"{name}: a click needs a point on it (label 1), inside the {w} x {h} image")
+            return
+        index = self.object_names.index(name)
+        wait["points"][index], wait["labels"][index] = points, labels
+        self.get_logger().info(f"{name}: clicked at {points}")
+        if all(p is not None for p in wait["points"]):
+            self.relocate_points = (wait["points"], wait["labels"])
+            self.relocate_by_mesh, self.relocate_carried = [], {}
+            self.awaiting_clicks = None
+            self.get_logger().info("every object clicked or located; initializing with those clicks")
+
+    def on_pose_prior(self, msg):
+        """A part's pose from whoever set it down (POSE_PRIOR_TOPIC)."""
+        try:
+            prior = json.loads(msg.data)
+            name = prior["object"]
+            pose = rigid(prior["pose"])
+            if name not in self.object_names or pose is None:
+                raise ValueError(f"needs one of {self.object_names} and a rigid 4x4 pose")
+        except (ValueError, KeyError, TypeError) as exc:
+            self.get_logger().error(f"unusable pose prior on {POSE_PRIOR_TOPIC}: {exc}")
+            return
+        self.pose_priors[name] = (np.asarray(pose, dtype=float), str(prior.get("source") or "client"))
+        self.get_logger().info(f"{name}: pose prior from {self.pose_priors[name][1]}, sent with the next frame")
+
+    def camera_priors(self, frame):
+        """The pose priors waiting, in the camera `frame`: meta["priors"]."""
+        if not self.pose_priors or not frame:
+            return []
+        try:
+            tf = self.tf_buffer.lookup_transform(frame, "world", Time())
+        except Exception as exc:
+            self.get_logger().warn(f"no TF {frame} <- world for the pose priors: {exc}", throttle_duration_sec=5.0)
+            return []
+        t, q = tf.transform.translation, tf.transform.rotation
+        cam_world = np.eye(4)
+        cam_world[:3, :3] = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
+        cam_world[:3, 3] = [t.x, t.y, t.z]
+        return [{"object": self.object_names.index(name), "pose": (cam_world @ pose).tolist(), "source": source}
+                for name, (pose, source) in self.pose_priors.items()]
+
+    def ask_binding(self, bboxes, rgb, header):
+        """Ask the person which way round, where a mesh's binding is in doubt
+        and the doubt matters (--ask-binding); withdraw what the views have
+        settled since. See BINDING_REQUEST_TOPIC. While another node asks
+        (BINDING_ASKER_TOPIC), every way round in doubt is kept as asked, for
+        its answers, and nothing is shown."""
+        if not isinstance(bboxes, list) or len(bboxes) != len(self.object_names):
+            return
+        agent_asks = self.args.ask_binding != "always" and self.agent_asking()
+        if agent_asks != getattr(self, "agent_asks", False):
+            self.agent_asks = agent_asks
+            self.get_logger().info("the Agent asks the person which way round; no request of mine" if agent_asks
+                                   else "no Agent asks which way round: I ask, as --ask-binding says")
+        for index, (name, bbox) in enumerate(zip(self.object_names, bboxes)):
+            binding = (bbox or {}).get("model_binding") if isinstance(bbox, dict) else None
+            ambiguous = isinstance(binding, dict) and binding.get("state") == "ambiguous"
+            fit = (self.model_offsets.get(name) or (None, None, None, {}))[3]
+            grasps = (getattr(self.args, "grasps", None) or {}).get(name)
+            matters = (self.args.ask_binding == "always" or agent_asks
+                       or (self.args.ask_binding == "needed" and not (grasps and fit.get("grasps_safe"))))
+            if not ambiguous or not matters or index in self.binding_answers:
+                if name in self.binding_asked and index not in self.binding_answers:
+                    self.withdraw_binding(name, "settled" if not ambiguous else "a grasp is safe either way")
+                continue
+            hypotheses = [h for h in binding.get("hypotheses") or [] if isinstance(h, dict) and h.get("id")]
+            ids = [h["id"] for h in hypotheses]
+            asked = self.binding_asked.get(name)
+            if asked is not None and asked["ids"] == ids:
+                continue
+            self.binding_asked[name] = {"fit_id": bbox.get("model_fit_id"), "ids": ids,
+                                        "features": {h["id"]: h.get("features_px") or [] for h in hypotheses},
+                                        "shown": not agent_asks}
+            if agent_asks:
+                continue
+            self.binding_request_pub.publish(String(data=json.dumps({
+                "object": name, "fit_id": bbox.get("model_fit_id"),
+                "hypotheses": [{"id": h["id"], "number": k, "p": h.get("p")} for k, h in enumerate(hypotheses)],
+                "frame_id": header.frame_id, "stamp": header.stamp.sec + header.stamp.nanosec * 1e-9})))
+            shown = rgb.copy()
+            for k, h in enumerate(hypotheses):
+                colour = BINDING_COLOURS[k % len(BINDING_COLOURS)]
+                px = np.asarray(h.get("features_px") or [], dtype=float).reshape(-1, 2)
+                for u, v in px:
+                    cv2.circle(shown, (int(u), int(v)), 3, colour, -1, cv2.LINE_AA)
+                if len(px):
+                    u, v = px.mean(0)
+                    label = f"{name} #{k} p={float(h.get('p') or 0):.2f}"
+                    cv2.putText(shown, label, (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(shown, label, (int(u) + 6, int(v) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                colour, 1, cv2.LINE_AA)
+            image = self.bridge.cv2_to_imgmsg(shown, "bgr8")
+            image.header = header
+            self.binding_image_pub.publish(image)
+            self.get_logger().warn(
+                f"{name}: which way round it lies is in doubt ({len(ids)} ways, "
+                f"{BINDING_REQUEST_IMAGE_TOPIC}); say which: {{\"object\": \"{name}\", \"hypothesis\": k}}, "
+                f"or click its telling feature: {{\"object\": \"{name}\", \"points\": [[u, v]]}} on {BINDING_TOPIC}")
+
+    def agent_asking(self) -> bool:
+        """Whether a node says on BINDING_ASKER_TOPIC that it asks the person
+        which way round; not where this client is no node to ask by."""
+        try:
+            return self.count_publishers(BINDING_ASKER_TOPIC) > 0
+        except AttributeError:                                  # not a node (stood up without rclpy)
+            return False
+
+    def withdraw_binding(self, name, why="re-initialized"):
+        asked = self.binding_asked.pop(name, None)
+        if asked is not None and not asked.get("shown", True):
+            return                                   # kept for the Agent's answers, never shown
+        self.binding_request_pub.publish(String(data=json.dumps({"object": name, "withdrawn": True, "why": why})))
+        self.get_logger().info(f"{name}: way round no longer asked ({why})")
+
+    def on_binding(self, msg):
+        """The person's way round (BINDING_TOPIC), to go with the next frame."""
+        try:
+            answer = json.loads(msg.data)
+            name = answer["object"]
+            asked = self.binding_asked.get(name)
+            if asked is None:
+                self.get_logger().warn(f"way round of {name}: none asked for")
+                return
+            if "hypothesis" in answer:
+                ident = answer["hypothesis"]
+                if isinstance(ident, int) and not isinstance(ident, bool):
+                    ident = asked["ids"][ident]
+                if ident not in asked["ids"]:
+                    raise ValueError(f"{ident!r} is none of {asked['ids']}")
+            else:
+                points = np.asarray([[float(u), float(v)] for u, v in answer["points"]], dtype=float)
+                if not len(points):
+                    raise ValueError("no points")
+
+                def apart(ident):
+                    px = np.asarray(asked["features"].get(ident) or [], dtype=float).reshape(-1, 2)
+                    return np.inf if not len(px) else float(np.mean(cKDTree(px).query(points)[0]))
+
+                ident = min(asked["ids"], key=apart)
+                if not np.isfinite(apart(ident)):
+                    raise ValueError("no way round shows features to click")
+            by = answer.get("by") or "person"
+            if not isinstance(by, str) or not re.fullmatch(r"[a-z+ ]{1,32}", by):
+                raise ValueError(f"'by' {by!r} is not a word such as person or camera")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            self.get_logger().error(f"unusable answer on {BINDING_TOPIC}: {exc}")
+            return
+        self.binding_answers[self.object_names.index(name)] = (ident, by)
+        self.binding_asked.pop(name, None)
+        self.get_logger().info(f"{name}: way round {ident}, by the {by}, sent with the next frame")
 
     def relocate_seen(self, lost, bboxes, hand=None):
         """Count each object's replies lost in a row, and keep the pixels and
@@ -954,12 +1341,40 @@ class PoseClient(Node):
                     if isinstance(bbox.get("model_fit_id"), str):
                         fit["fit_id"] = bbox["model_fit_id"]
                     for key, field in (("spin_doubt", "model_spin_doubt"), ("ends_doubt", "model_ends_doubt")):
-                        doubt = np.asarray(bbox.get(field, np.nan), dtype=float)
-                        if (doubt.shape == (4, 4) and np.isfinite(doubt).all()
-                                and np.allclose(doubt[3], [0, 0, 0, 1], atol=1e-6)
-                                and np.allclose(doubt[:3, :3].T @ doubt[:3, :3], np.eye(3), atol=1e-5)
-                                and np.linalg.det(doubt[:3, :3]) > 0):
-                            fit[key] = doubt.tolist()
+                        doubt = rigid(bbox.get(field))
+                        if doubt is not None:
+                            fit[key] = doubt
+                    # Every way round in doubt: those two, and any other the
+                    # view cannot tell from the pose (a quarter turn, say).
+                    doubts = [rigid(d) for d in (bbox.get("model_doubts") or [])]
+                    if any(d is not None for d in doubts):
+                        fit["doubts"] = [d for d in doubts if d is not None]
+                    # How far the binding is (BINDING_REQUEST_TOPIC), and the
+                    # grasps no way round living changes.
+                    if isinstance(bbox.get("model_prior"), dict):
+                        fit["prior"] = bbox["model_prior"]
+                    binding = bbox.get("model_binding")
+                    if isinstance(binding, dict):
+                        # All of it: the evidence too -- each way round's
+                        # probability, whether it is in doubt, where its
+                        # telling features are in the image (this frame's,
+                        # the camera's pixels) -- and how much of it there
+                        # is, for the Agent to weigh beside its own look.
+                        fit["binding"] = {
+                            "state": binding.get("state"), "by": binding.get("by"),
+                            "confidence": binding.get("confidence"), "frames": binding.get("frames"),
+                            "error_rate": binding.get("error_rate"),
+                            "hypotheses": [{"id": h.get("id"), "turn": h.get("turn"), "p": h.get("p"),
+                                            "in_doubt": h.get("in_doubt"), "features_px": h.get("features_px") or []}
+                                           for h in binding.get("hypotheses") or [] if isinstance(h, dict)],
+                            "ruled_out": binding.get("ruled_out") or []}
+                    grasps = (getattr(self.args, "grasps", None) or {}).get(name)
+                    if grasps:
+                        turns = [d for d in (rigid(h.get("turn")) for h in (fit.get("binding") or {}).get(
+                            "hypotheses", [])[1:]) if d is not None] or fit.get("doubts", [])
+                        fit["grasps_safe"] = safe_grasps(grasps, linear, turns,
+                                                         self.args.grasp_tolerance_mm / 1000.0,
+                                                         self.args.grasp_tolerance_deg, self.args.grasp_flip_axis)
                     # What the mesh itself leaves open, whatever the view: the
                     # axis (in its frame) it is round about, the turn about
                     # which the server holds and nothing tells; and whether its
@@ -974,8 +1389,12 @@ class PoseClient(Node):
                             "ends": bool(symmetry.get("ends"))}
                     self.model_offsets[name] = (np.linalg.inv(T_anchor) @ model, scale, model_id, fit)
                     if name in required_models:
-                        # The box in the mesh's own axes, not the server's.
+                        # The box in the mesh's own axes, not the server's; of
+                        # the part, where the server left loose fragments out.
                         centre, extent = mesh_box(required_models[name][0], linear)
+                        bounds = np.asarray(bbox.get("model_bounds", np.nan), dtype=float)
+                        if bounds.shape == (2, 3) and np.isfinite(bounds).all() and np.all(bounds[1] > bounds[0]):
+                            centre, extent = bounds.mean(0), bounds[1] - bounds[0]
                         T_box = model.copy()
                         T_box[:3, 3] = model[:3, :3] @ centre + model[:3, 3]
                         self.box_offsets[name] = (np.linalg.inv(T_anchor) @ T_box, extent)
@@ -1293,13 +1712,41 @@ def main():
                          "has the server locate it by the mesh")
     ap.add_argument("--labels", default="[[1]]", help="JSON: one [1/0,...] list per object")
     ap.add_argument("--objects", required=True,
-                    help="comma-separated names, one per --points group (e.g. tester,sample)")
+                    help="comma-separated names, one per --points group (e.g. mug,lid)")
     ap.add_argument("--models", default="{}",
                     help="JSON: {name: path to an OBJ mesh of that object, in metres}. "
                          "An object with a mesh gets the mesh's box, fit on the init "
                          "frame, and with no --points is located by it. Failed pose fits remain "
                          "unrecognised while the server retries on fresh frames; "
                          "there is no point-cloud box fallback")
+    ap.add_argument("--same-scale-meshes", action="store_true",
+                    help="the meshes of --models come from one reconstruction, so are off the parts' "
+                         "true sizes by about one factor: a part's scale is then checked against the "
+                         "others', and one too hidden to measure takes theirs. Leave off for meshes "
+                         "from different sources")
+    ap.add_argument("--true-size-meshes", action="store_true",
+                    help="the meshes of --models are the parts' true sizes (CAD models, or "
+                         "reconstructions scaled to measure): each is fitted at that size only, "
+                         "which also tells it from parts of the same shape and another size")
+    ap.add_argument("--mesh-colours", action="store_true",
+                    help="send each mesh's vertex colours (an OBJ's \"v x y z r g b\" lines), which the "
+                         "server then also locates its part by: of two parts alike in size and shape, "
+                         "the one in the mesh's colours")
+    ap.add_argument("--grasps", default=None,
+                    help="JSON file: {name: [4x4, ...]}, each the gripper's pose in that object's mesh frame "
+                         "and units; each reply then says which no way round in doubt changes "
+                         "(BINDING_REQUEST_TOPIC)")
+    ap.add_argument("--grasp-tolerance-mm", type=float, default=10.0,
+                    help="a way round in doubt moving a grasp no more than this leaves it safe")
+    ap.add_argument("--grasp-tolerance-deg", type=float, default=15.0,
+                    help="nor turning it more than this")
+    ap.add_argument("--grasp-flip-axis", default="none", choices=["x", "y", "z", "none"],
+                    help="the gripper's axis it is the same turned half round about (a parallel "
+                         "gripper's approach axis), in the grasp's frame")
+    ap.add_argument("--ask-binding", default="needed", choices=["needed", "always", "never"],
+                    help="when to ask the person which way round a part lies: where its doubt matters -- "
+                         "no grasp safe, or none given -- always while in doubt, or never. While a node "
+                         f"publishes on {BINDING_ASKER_TOPIC} (the Agent) it asks, and needed asks nothing")
     ap.add_argument("--props", default="",
                     help="comma-separated names announced beside --objects whose poses another "
                          "node publishes: truth_bridge.py --props ... --no-announce")
@@ -1325,7 +1772,7 @@ def main():
     args.objects = [name.strip() for name in args.objects.split(",")]
     if (len(set(args.objects)) != len(args.objects)
             or not all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) for name in args.objects)):
-        ap.error("--objects must be distinct names such as tester,sample")
+        ap.error("--objects must be distinct names such as mug,lid")
     args.props = [name.strip() for name in args.props.split(",") if name.strip()]
     args.not_robot = {name.strip() for name in args.not_robot.split(",") if name.strip()}
     if (set(args.props) & set(args.objects)
@@ -1360,9 +1807,26 @@ def main():
             ap.error(f"{name}: no points and no mesh in --models to locate it by")
     args.init_timeout_ms += LOCATE_TIMEOUT_MS * sum(1 for points in groups if not points)
     try:
-        args.models = {name: read_obj(path) for name, path in paths.items()}
+        loaded = {name: read_obj(path, colours=True) for name, path in paths.items()}
     except (OSError, ValueError) as exc:
         ap.error(f"--models: {exc}")
+    args.models = {name: (v, f) for name, (v, f, _) in loaded.items()}
+    args.grasp_flip_axis = None if args.grasp_flip_axis == "none" else np.eye(3)["xyz".index(args.grasp_flip_axis)]
+    if args.grasps:
+        try:
+            raw = json.load(open(args.grasps))
+            args.grasps = {name: [np.asarray(G, dtype=float).reshape(4, 4) for G in grasps]
+                           for name, grasps in raw.items()}
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            ap.error(f"--grasps: {exc}")
+        if not set(args.grasps) <= set(paths):
+            ap.error("--grasps: only objects with a mesh in --models have grasps in its frame")
+    else:
+        args.grasps = {}
+    args.model_colours = ({name: c for name, (_, _, c) in loaded.items() if c is not None}
+                          if args.mesh_colours else {})
+    for name in sorted(set(paths) - set(args.model_colours) if args.mesh_colours else ()):
+        print(f"--mesh-colours: {name}'s mesh has no colour on every vertex; sent without", file=sys.stderr)
 
     rclpy.init()
     node = PoseClient(args)

@@ -12,38 +12,14 @@
   1.0
  ],
  "depth_factor": 1.0,
- "timestamp": 350.087,
+ "timestamp": 95.213,
  "points": [
   [],
-  [],
-  [
-   [
-    170,
-    219
-   ],
-   [
-    273,
-    374
-   ],
-   [
-    221,
-    177
-   ],
-   [
-    228,
-    199
-   ]
-  ]
+  []
  ],
  "labels": [
   [],
-  [],
-  [
-   1,
-   1,
-   0,
-   0
-  ]
+  []
  ],
  "models": [
   {
@@ -53,9 +29,10 @@
   {
    "vertices": 23536,
    "faces": 44366
-  },
-  null
+  }
  ],
+ "discover": 4,
+ "same_scale_meshes": true,
  "robot_mask": {
   "shape": [
    480,
