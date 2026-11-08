@@ -21,6 +21,8 @@ import zmq
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PoseArray, Pose, PoseStamped
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
 from scipy.spatial import cKDTree
@@ -30,6 +32,7 @@ from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 from yolo_msgs.msg import BoundingBox3D
+from pose_stream import LatestFrame
 
 BBOX_TOPIC = "/point2pose/bboxes"
 # Where the server cannot locate an object by its mesh for sure -- it fits no
@@ -408,7 +411,8 @@ class PoseClient(Node):
         self.args = args
         self.K = None
         self.initialized = False
-        self.last_sent = 0.0
+        self._frames = LatestFrame()
+        self._frame_received = None
         self.object_names = args.objects
         # name -> (vertices, faces); sent once, with the init request.
         self.models = args.models
@@ -481,10 +485,16 @@ class PoseClient(Node):
         self.get_logger().info(f"connected to {args.server}")
 
         self.create_subscription(CameraInfo, args.info_topic, self.on_info, 10)
-        rgb_sub = message_filters.Subscriber(self, Image, args.rgb_topic)
-        depth_sub = message_filters.Subscriber(self, Image, args.depth_topic)
-        sync = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 10, 0.05)
+        # Image callbacks keep running while the default group waits on the
+        # server. Only the newest synchronized pair survives that wait.
+        self._image_group = MutuallyExclusiveCallbackGroup()
+        rgb_sub = message_filters.Subscriber(self, Image, args.rgb_topic,
+                                            qos_profile=QoSProfile(depth=1), callback_group=self._image_group)
+        depth_sub = message_filters.Subscriber(self, Image, args.depth_topic,
+                                              qos_profile=QoSProfile(depth=1), callback_group=self._image_group)
+        sync = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], 2, 0.05)
         sync.registerCallback(self.on_frame)
+        self._frame_timer = self.create_timer(0.01, self.process_latest_frame)
         self.create_subscription(String, TACTILE_TOPIC, self.on_tactile, 10)
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.click_request_pub = self.create_publisher(String, CLICK_REQUEST_TOPIC, latched)
@@ -665,15 +675,33 @@ class PoseClient(Node):
         return self.sock.recv_json()
 
     def on_frame(self, rgb_msg, depth_msg):
+        self._frames.put(rgb_msg, depth_msg)
+
+    def process_latest_frame(self):
+        # A blocking server request exceeds the timer period. Without rearming
+        # after it returns, the always-ready timer starves binding subscriptions
+        # in this same mutually exclusive callback group.
+        self._frame_timer.cancel()
+        try:
+            latest = self._frames.take(self.args.rate)
+            if latest is None:
+                return
+            rgb, depth, self._frame_received = latest
+            self.track_frame(rgb, depth)
+        finally:
+            self._frame_timer.reset()
+
+    def observation_age(self):
+        received = getattr(self, "_frame_received", None)
+        return max(0.0, time.monotonic() - received) if received is not None else 0.0
+
+    def track_frame(self, rgb_msg, depth_msg):
         if self.K is None:
             return
         if (not self.initialized and self.robot_links is None
                 and time.time() - self.started < ROBOT_WAIT_S):
             return
         now = time.time()
-        if now - self.last_sent < 1.0 / self.args.rate:
-            return
-        self.last_sent = now
         if self.server_busy:
             # This frame is old by the time the server is free; send the next.
             self.server_free()
@@ -813,6 +841,12 @@ class PoseClient(Node):
             self.binding_answers = {}
         if meta.get("priors"):
             self.pose_priors = {}
+        age = self.observation_age()
+        if age > self.args.max_pose_age:
+            self._invalidate_all()
+            self.get_logger().warn(f"discarding pose from an image received {age:.2f}s ago; "
+                                   "waiting for the latest frame", throttle_duration_sec=2.0)
+            return
         self.ask_binding(reply.get("bboxes"), rgb, rgb_msg.header)
         self.say_mesh_changes(reply.get("model_errors"))
         out = PoseArray()
@@ -840,7 +874,8 @@ class PoseClient(Node):
                                                   renamed=meta["cmd"] == "init").markers
         self.bbox_pub.publish(markers)
         self.get_logger().info(
-            f"frame {reply['frame_id']} latency={reply['latency_ms']}ms lost={lost}",
+            f"frame {reply['frame_id']} latency={reply['latency_ms']}ms lost={lost} "
+            f"observation_age={self.observation_age():.3f}s",
             throttle_duration_sec=2.0,
         )
         if meta["cmd"] == "track":
@@ -1495,7 +1530,11 @@ class PoseClient(Node):
                 model_pose[:3, :3] = world_rotation.as_matrix() @ offset[:3, :3]
                 self.model_pubs[name].publish(String(data=json.dumps({
                     "frame_id": "world", "pose": model_pose.tolist(),
-                    "model_id": model_id, "scale": scale, **fit})))
+                    "model_id": model_id, "scale": scale, **fit,
+                    "stamp": poses.header.stamp.sec + poses.header.stamp.nanosec * 1e-9,
+                    # Age since local image receipt; monotonic time also
+                    # works when image stamps use the simulation clock.
+                    "observation_age_s": self.observation_age()})))
             else:
                 self.model_pubs[name].publish(String(data=json.dumps({"valid": False})))
             box = self.box_offsets.get(name)
@@ -1759,6 +1798,8 @@ def main():
                          "on it lies within the margin of")
     ap.add_argument("--depth-factor", type=float, default=1000.0)
     ap.add_argument("--rate", type=float, default=10.0)
+    ap.add_argument("--max-pose-age", type=float, default=3.0,
+                    help="discard poses this many seconds after local image receipt (default 3)")
     ap.add_argument("--jpeg-quality", type=int, default=90)
     ap.add_argument("--timeout-ms", type=int, default=15000, help="per tracking frame")
     ap.add_argument("--init-timeout-ms", type=int, default=60000,
@@ -1770,6 +1811,8 @@ def main():
 
     # Each name becomes a topic (/detected/<name>_pose) the Agent subscribes to.
     args.objects = [name.strip() for name in args.objects.split(",")]
+    if not np.isfinite(args.rate) or args.rate <= 0 or not np.isfinite(args.max_pose_age) or args.max_pose_age <= 0:
+        ap.error("--rate and --max-pose-age must be finite and positive")
     if (len(set(args.objects)) != len(args.objects)
             or not all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) for name in args.objects)):
         ap.error("--objects must be distinct names such as mug,lid")
@@ -1830,11 +1873,14 @@ def main():
 
     rclpy.init()
     node = PoseClient(args)
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()
 

@@ -674,6 +674,11 @@ MODEL_UPGRADE_INTERVAL_SEC = 6.0
 # round on SAM2's mask and on one cut by its colour, its retries settling it
 # on a profile 0.12 against 0.13, and a client running the scene saw its z
 # reversed against the replay's (2026-10-30).
+# A fine refit over a coarse one may improve size and alignment, but may not
+# publish a half turn just because its geometric fit ranks higher. First
+# check the refined shape in the currently published direction on this
+# frame. Upgrade only if that direction itself passes the fine-fit checks;
+# keep the other direction in doubt (preserve_refit_direction()).
 MODEL_REFIT_TURN_DEG = 90.0
 # Kept, a fit is carried by the tracked motion, and the motion can go wrong
 # with the track not lost: a ring lifted face-on in the gripper was tracked
@@ -796,8 +801,8 @@ SURFACE_PUBLISH_EVERY = 5
 # when the odds of the votes for it against the other and that third reach
 # BINDING_CONFIDENCE, on votes from SURFACE_MIN_SEEN frames looked at or
 # more: one view tells nothing a mesh's error might not, and a vote is worth
-# at most twice a toss against the third, so at least seven clean votes and
-# none against it decide. A reconstruction whose probe is off the part's has
+# at most twice a toss against the third, so several independent votes are
+# needed. A reconstruction whose probe is off the part's has
 # its probe seen through the right way round too, and then the third wins.
 #
 # A way round beaten is dropped; the one left is the binding, published from
@@ -815,7 +820,7 @@ SURFACE_PUBLISH_EVERY = 5
 # the binding is (model_binding), and where each way round in doubt has the
 # features that would tell it, up to BINDING_FEATURE_PX image points of them.
 BINDING_EVERY = SURFACE_EVERY
-BINDING_CONFIDENCE = 0.99
+BINDING_CONFIDENCE = 0.95
 BINDING_FEATURE_PX = 60
 # Two ways round turned end for end ("ends", turn_kind()) differ where the
 # part's two ends differ -- a notch at one end, a probe -- and that can be
@@ -3252,14 +3257,17 @@ class Binding:
         return {j: float(weight[j] / total) for j in living}
 
     def choose(self, ident, by="person"):
-        """The way round named, by its id, the others ruled out: the
-        person's, or whoever's `by` says -- the Agent's own look at the
-        camera's view ("camera"), the robot's word of how it put the part
-        down ("robot") -- which the reply's "by" then says. Whether it was
-        one of the living."""
+        """Accept a living way round by id. Camera choices keep alternatives
+        for later views; person/robot choices rule the alternatives out.
+        update_bindings() publishes the accepted camera choice."""
         if ident not in self.ids or not self.alive[self.ids.index(ident)]:
             return False
         keep = self.ids.index(ident)
+        if by == "camera":
+            # One automatic view is revisable: keep the other hypotheses
+            # available to the independent views gathered during motion.
+            self.by = by
+            return True
         for k in self.living():
             if k != keep:
                 self.alive[k], self.ruled[k] = False, (by, f"the {by} chose {ident}")
@@ -4441,9 +4449,13 @@ class PoseServer:
                     if fit is not None and (current is None or fit_rank(model) > fit_rank(current)):
                         T_box, extent, note = fit
                         model.fitted_pose = here
-                        to_here = here @ np.linalg.inv(fitted_in_camera)
                         turn = None if current is None else refit_turn(current, model.fitted_pose)
-                        if turn is not None:
+                        upgrade = turn is not None and fit_rank(model)[0] and not fit_rank(current)[0]
+                        if upgrade:
+                            upgrade, why = self.preserve_refit_direction(index, current, model, frame,
+                                                                         regions, motions)
+                            self.say(f"object {index}: refit direction check: {why}")
+                        if turn is not None and not upgrade:
                             # The fit stays, the refit in doubt: see MODEL_REFIT_TURN_DEG.
                             setattr(current, f"fitted_{turn}_doubt",
                                     np.linalg.inv(current.fitted_pose) @ model.fitted_pose)
@@ -4451,15 +4463,28 @@ class PoseServer:
                                   f"{'half round about its length' if turn == 'spin' else 'end for end'}; "
                                   f"keeping the fit, the refit sent in doubt ({note})", flush=True)
                         else:
-                            self.boxes[index] = (to_here @ T_box, extent)
+                            if upgrade:
+                                # The refined shape was checked at a different
+                                # pose; rebuild its box in that same frame.
+                                B = model.box[:3, :3]
+                                T_box = model.fitted_pose.copy()
+                                T_box[:3, :3] = model.fitted_pose[:3, :3] @ B
+                                T_box[:3, 3] += model.fitted_pose[:3, :3] @ (model.fitted_linear @ model.box[:3, 3])
+                                extent = fitted_axis_scale(model) * model.extent
+                                self.boxes[index] = (T_box, extent)
+                            else:
+                                to_here = here @ np.linalg.inv(fitted_in_camera)
+                                self.boxes[index] = (to_here @ T_box, extent)
                             self.fitted_models[index] = model
                             self.object_state(len(self.models))
                             self.still_motions[index] = np.asarray(motions[index], dtype=np.float64).copy()
                             self.remember_scale(model)
                             self.model_errors[index] = None
                             print(f"[server] object {index}: mesh "
-                                  f"{'localized' if current is None else 'fit improved'} on retry ({note})",
-                                  flush=True)
+                                  f"{'localized' if current is None else 'fit improved'} on retry"
+                                  + (", fine over coarse in the published direction; "
+                                     "the refit's other direction kept in doubt" if upgrade else "")
+                                  + f" ({note})", flush=True)
                     elif current is not None:
                         print(f"[server] object {index}: "
                               + (f"refit not taken ({unchecked})" if unchecked else "refit no better")
@@ -4792,6 +4817,45 @@ class PoseServer:
         best, _ = self.best_on_view(model, (fit, mask, metres, K), candidates)
         return None if best is None else best[:2]
 
+    def preserve_refit_direction(self, index, current, model, frame, regions, motions):
+        """Validate a finer shape in the old direction before publishing it.
+
+        Both stored poses use the tracker's reference frame. Recheck on the
+        current camera frame, including motion, and allow only ordinary
+        carried-pose corrections. On failure neither model is changed.
+        """
+        view = self.frame_view(index, frame, regions, model)
+        if view is None:
+            return False, "no current view; keeping the published direction"
+        fit, _, _, _ = view
+        motion = np.asarray(motions[index], dtype=np.float64)
+        start = motion @ current.fitted_pose
+        posed, _ = correct_carried_pose(fit, model, start)
+        move, angle = correction_size(model, start, posed)
+        if move > MODEL_CORRECT_MAX_M or angle > MODEL_CORRECT_MAX_DEG:
+            return False, "refined shape needs a large correction; keeping the published direction"
+        terms = fit.terms(fitted_axis_scale(model), posed[:3, :3], posed[:3, 3], *MODEL_CHECK_POINTS)
+        why = "no fit" if terms is None else model_pose_rejection(terms)
+        if why:
+            return False, f"published direction is not a fine fit ({why}); other direction left in doubt"
+        old_pose = model.fitted_pose.copy()
+        new_pose = np.linalg.inv(motion) @ posed
+        base = np.linalg.inv(new_pose) @ old_pose
+        # Re-express every candidate in the new published frame; include the
+        # refit's original pose, which was not a doubt relative to itself.
+        doubts = [base @ d for d in [np.eye(4)] + model_doubts(model)]
+        doubts = [d for d in doubts if not same_way(model, np.eye(3), d[:3, :3])]
+        model.fitted_unlikely = [base @ d for d in getattr(model, "fitted_unlikely", [])]
+        model.fitted_pose = new_pose
+        model.fitted_doubts = doubts
+        model.fitted_spin_doubt = next((d for d in doubts if turn_kind(model, d[:3, :3]) == "spin"), None)
+        model.fitted_ends_doubt = next((d for d in doubts if turn_kind(model, d[:3, :3]) == "ends"), None)
+        # Measurement claims and axis diagnostics belonged to the other pose.
+        model.fitted_measured = bool(terms.get("measured", False))
+        model.fitted_axis_source = None
+        model.fitted_axial = None
+        return True, "fine fit verified in the published direction; other direction left in doubt"
+
     def adopt_refit(self, index, model, frame, regions, motions, capture_inverse, fitted_on):
         """The pose to send a background refit (`model`, its fitted_pose in
         the camera of frame `fitted_on`) with on this frame, in the tracker's
@@ -4999,6 +5063,8 @@ class PoseServer:
                     ident, by = chosen if isinstance(chosen, tuple) else (chosen, "person")
                     if binding.choose(ident, by):
                         self.say(f"object {index}: way round {ident} chosen by the {by}")
+                        if by == "camera" and binding.ids.index(ident):
+                            self.turn_binding(index, model, binding, binding.ids.index(ident))
                     else:
                         self.say(f"object {index}: way round {ident} chosen by the {by}, but it is none in doubt; "
                                  "ignored")
