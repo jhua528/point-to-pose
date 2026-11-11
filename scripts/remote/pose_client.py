@@ -586,18 +586,25 @@ class PoseClient(Node):
                                    throttle_duration_sec=30.0)
         return robot_pixels(metres, self.K, np.concatenate(clouds), ROBOT_MARGIN_M)
 
-    def link_in(self, frame, link, depth=0):
-        """`link`'s pose in `frame` (4x4) from TF, or else from its parent's
-        and its URDF joint at zero; None where neither is known. The finger
-        pads' joints are in no /joint_states, so they have no TF, and the
-        pads -- what touches a part -- were left out of the robot's pixels."""
-        try:
-            tf = self.tf_buffer.lookup_transform(frame, link, Time())
-        except Exception:
+    def link_in(self, frame, link, depth=0, stamp=None):
+        """`link`'s pose in `frame` (4x4) from TF -- at `stamp` (a message's)
+        where TF still holds that time, else its latest -- or else from its
+        parent's and its URDF joint at zero; None where neither is known. The
+        finger pads' joints are in no /joint_states, so they have no TF, and
+        the pads -- what touches a part -- were left out of the robot's
+        pixels."""
+        tf = None
+        for when in ([Time.from_msg(stamp)] if stamp is not None else []) + [Time()]:
+            try:
+                tf = self.tf_buffer.lookup_transform(frame, link, when)
+                break
+            except Exception:
+                continue
+        if tf is None:
             joint = getattr(self, "robot_joints", {}).get(link)
             if joint is None or depth > 3:
                 return None
-            parent = self.link_in(frame, joint[0], depth + 1)
+            parent = self.link_in(frame, joint[0], depth + 1, stamp)
             return None if parent is None else parent @ joint[1]
         q, t = tf.transform.rotation, tf.transform.translation
         T = np.eye(4)
@@ -833,7 +840,13 @@ class PoseClient(Node):
             self._invalidate_all()
             self.get_logger().error("server returned the wrong number or shape of poses")
             return
-        self.relocate_seen(lost, reply.get("bboxes"), self.link_in(rgb_msg.header.frame_id, HAND_LINK))
+        # The hand where it was when the image was taken, as the boxes are:
+        # its latest pose, some 2 s on, had carried the tester away from its
+        # last box, and the tester lost in the hand was located again by its
+        # mesh -- not found there, the person asked to click it (PP-S1-4,
+        # 2026-11-09).
+        self.relocate_seen(lost, reply.get("bboxes"),
+                           self.link_in(rgb_msg.header.frame_id, HAND_LINK, stamp=rgb_msg.header.stamp))
         # Apply mesh recognition validity before publishing even the raw array:
         # an anchor tracked after a failed mesh fit is not an object pose.
         self.update_boxes(poses, lost, reply.get("bboxes"))
@@ -975,6 +988,20 @@ class PoseClient(Node):
             return
         self.pose_priors[name] = (np.asarray(pose, dtype=float), str(prior.get("source") or "client"))
         self.get_logger().info(f"{name}: pose prior from {self.pose_priors[name][1]}, sent with the next frame")
+        wait = self.awaiting_clicks
+        if wait is not None and name in wait["asked"] and wait["points"][self.object_names.index(name)] is None:
+            # A click asked on it while it was in the hand, out of view, waits
+            # for nothing now: it is set down, where the init locates it by its
+            # mesh. PP-S1-4's tester, lost in the hand, waited for a click the
+            # person could not give, and no frame went after it (2026-11-09).
+            missing = [n for n in wait["asked"] if wait["points"][self.object_names.index(n)] is None]
+            points = [p if p is not None else [] for p in wait["points"]]
+            labels = [l if l is not None else [] for l in wait["labels"]]
+            self.relocate_points = (points, labels)
+            self.relocate_by_mesh, self.relocate_carried = missing, {}
+            self.awaiting_clicks = None
+            self.get_logger().info(f"{', '.join(missing)}: no click waited for now it is set down; "
+                                   "located again by its mesh")
 
     def camera_priors(self, frame):
         """The pose priors waiting, in the camera `frame`: meta["priors"]."""
