@@ -392,6 +392,18 @@ def box_distance(point, T, extent):
     return float(np.linalg.norm(np.maximum(np.abs(local) - np.asarray(extent, dtype=np.float64) / 2, 0.0)))
 
 
+def obstacles_by_name(obstacles):
+    """A reply's obstacles ({"id", "lost", "bbox"}) by the name each is
+    followed under (OBSTACLE_PREFIX and its id), in the reply's order."""
+    found = {}
+    for item in obstacles if isinstance(obstacles, list) else []:
+        try:
+            found[f"{OBSTACLE_PREFIX}{int(item['id'])}"] = item
+        except (KeyError, TypeError, ValueError):
+            continue
+    return found
+
+
 def reply_box(bbox):
     """(pose 4x4, extent) of a reply's box, or None."""
     try:
@@ -855,6 +867,17 @@ class PoseClient(Node):
         if meta.get("priors"):
             self.pose_priors = {}
         age = self.observation_age()
+        if meta["cmd"] == "init":
+            # An init's obstacles are named now, its frame however old: an
+            # init takes 20 s and more, so its reply was always past
+            # max_pose_age and dropped below before its obstacles were named,
+            # and none was ever announced -- 45 inits of batch 20261112_214052,
+            # the person's hand on the bar and PP-S3's box among them. Their
+            # boxes are published with the first reply fresh enough.
+            lost_markers = MarkerArray()
+            self.name_obstacles(reply.get("obstacles"), lost_markers)
+            if lost_markers.markers:
+                self.bbox_pub.publish(lost_markers)
         if age > self.args.max_pose_age:
             self._invalidate_all()
             self.get_logger().warn(f"discarding pose from an image received {age:.2f}s ago; "
@@ -1623,23 +1646,10 @@ class PoseClient(Node):
         """Publish a reply's obstacles (OBSTACLE_PREFIX) and return their
         markers. On an init's reply (`renamed`) the names are those it found,
         announced with the objects; one found before and not now is lost."""
-        obstacles = obstacles if isinstance(obstacles, list) else []
         markers = MarkerArray()
-        found = {}
-        for item in obstacles:
-            try:
-                found[f"{OBSTACLE_PREFIX}{int(item['id'])}"] = item
-            except (KeyError, TypeError, ValueError):
-                continue
+        found = obstacles_by_name(obstacles)
         if renamed:
-            for name in self.obstacle_names:
-                if name not in found:
-                    self.obstacle_lost(name, markers)
-            if list(found) != self.obstacle_names:
-                self.obstacle_names = list(found)
-                self.objects_pub.publish(String(data=",".join(
-                    [*self.object_names, *self.args.props, *self.obstacle_names])))
-                self.get_logger().info(f"obstacles found: {', '.join(self.obstacle_names) or 'none'}")
+            self.name_obstacles(obstacles, markers)
         world = np.eye(4)
         if header.frame_id != "world":
             try:
@@ -1712,6 +1722,20 @@ class PoseClient(Node):
                 self.create_publisher(BoundingBox3D, f"/detected/{name}_box", 10),
                 self.create_publisher(Bool, f"/point2pose/{name}/lost", 10))
         return self.obstacle_pubs[name]
+
+    def name_obstacles(self, obstacles, markers):
+        """Take an init reply's obstacles as the ones followed: one followed
+        before and not found now is lost (its marker's deletion into
+        `markers`), and the names are announced with the objects."""
+        found = obstacles_by_name(obstacles)
+        for name in self.obstacle_names:
+            if name not in found:
+                self.obstacle_lost(name, markers)
+        if list(found) != self.obstacle_names:
+            self.obstacle_names = list(found)
+            self.objects_pub.publish(String(data=",".join(
+                [*self.object_names, *self.args.props, *self.obstacle_names])))
+            self.get_logger().info(f"obstacles found: {', '.join(self.obstacle_names) or 'none'}")
 
     def obstacle_lost(self, name, markers):
         """Say an obstacle is lost, and add the deletion of its marker."""

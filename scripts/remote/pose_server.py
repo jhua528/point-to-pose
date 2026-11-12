@@ -41,6 +41,7 @@ import argparse
 import base64
 import collections
 import copy
+import functools
 import gc
 import hashlib
 import itertools
@@ -54,20 +55,39 @@ import traceback
 import types
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+import pickle
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures.process import BrokenProcessPool
+
+# A mesh-fit worker (FIT_WORKERS) is this file imported again in a process of
+# its own: it fits with numpy, scipy and cv2 alone. Without torch, SAM2 and the
+# pipeline it holds about 110 MB, not 450, and never touches the GPU.
+FIT_WORKER_ENV = "POSE_SERVER_FIT_WORKER"
+IN_FIT_WORKER = os.environ.get(FIT_WORKER_ENV) == "1"
 
 import cv2
 import numpy as np
-import torch
-import zmq
-from omegaconf import OmegaConf
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from point2pose.data_types.frame import Frame
-from point2pose.pipeline.modular_pipeline import ModularPipeline
+if not IN_FIT_WORKER:
+    import torch
+    import zmq
+    from omegaconf import OmegaConf
+
+    from point2pose.data_types.frame import Frame
+    from point2pose.modules.segmenter.sam2_real_time_segmenter import Sam2RealTimeSegmenter
+    from point2pose.modules.tracker.tapir_tracker import TapirTracker
+    from point2pose.pipeline.modular_pipeline import ModularPipeline
+
+    # Every init builds a new pipeline; its SAM2 and TAPIR reuse the models
+    # the first one loaded (~3-5 s an init otherwise) and only their tracking
+    # state is new. kept_model_mib() is their share of the GPU.
+    Sam2RealTimeSegmenter.keep_models = True
+    TapirTracker.keep_models = True
 
 
 def decode_rgb(buf):
@@ -965,6 +985,14 @@ def gpu_alloc_sites(limit=GPU_TRACE_SITES):
                                for f in (ours or frames)[:4]) or "(allocated before the trace began)"
             sites[site] += block["size"]
     return sum(sites.values()) / 2**20, [(size / 2**20, site) for site, size in sites.most_common(limit)]
+
+
+def kept_model_mib():
+    """GPU memory of the models kept across pipelines (keep_models): held
+    on purpose, not by an earlier session (GPU_HELD_WARN_MIB)."""
+    models = [*Sam2RealTimeSegmenter._kept.values(), *TapirTracker._kept.values()]
+    tensors = [t for m in models for t in (*m.parameters(), *m.buffers()) if t.is_cuda]
+    return sum(t.numel() * t.element_size() for t in tensors) / 2**20
 
 
 def no_grad_thread():
@@ -2161,13 +2189,16 @@ class _ModelFit:
 
     def run(self):
         mesh_n, obs_n, rounds = MODEL_COARSE
-        coarse = []
+        starts, jobs = [], []
         for which, s in enumerate(self.start_scales()):
             for R in self.candidates():
-                t = self.place(s, R, mesh_n)
-                R, t, terms = self.icp(s, R, t, rounds, mesh_n, obs_n, MODEL_SEARCH_M)
-                if terms is not None:
-                    coarse.append((terms["cost"], which, R, t, s))
+                starts.append((which, s))
+                jobs.append((s, R, mesh_n, obs_n, rounds))
+        coarse = []
+        # Independent starts, fitted FIT_WORKERS at a time, in this order.
+        for (which, s), (R, t, terms) in zip(starts, fit_jobs(self, "coarse", jobs)):
+            if terms is not None:
+                coarse.append((terms["cost"], which, R, t, s))
         if not coarse:
             return None
         coarse.sort(key=lambda item: item[0])
@@ -2175,12 +2206,10 @@ class _ModelFit:
         for which in {item[1] for item in coarse}:
             kept += [item for item in coarse if item[1] == which][:MODEL_KEEP_PER_START]
         kept = sorted({id(item): item for item in kept}.values(), key=lambda item: item[0])
-        refined = []
-        for _, _, R, t, s in kept:
-            R, t, terms = self.icp(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES,
-                                   MODEL_FINE_POINTS, 2 * self.tol)
-            if terms is not None:
-                refined.append((terms, R, t, s))
+        jobs = [(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * self.tol)
+                for _, _, R, t, s in kept]
+        refined = [(terms, R, t, s) for (_, _, _, _, s), (R, t, terms) in zip(kept, fit_jobs(self, "icp", jobs, 2))
+                   if terms is not None]
         if not refined:
             return None
         results, done = [], []
@@ -2282,19 +2311,13 @@ class _ModelFit:
                 # raised whole instead (cover_seen()), 31 mm thick of 27. So
                 # a length the view spans is drawn out too, and kept if, so
                 # drawn, its ends show.
-                tries = [self.polish(scale, R, t, terms, free_axes=True)]
                 seen = self.axes_seen(R, t, scale)
                 spanned = self.axes_seen(R, t, scale, ends=False)
-                bound = np.broadcast_to(np.asarray(scale, np.float64), (3,)) * MODEL_STRETCH_MAX
-                for free in ([seen, spanned] if (spanned & ~seen).any() else [seen]):
-                    if not free.any():
-                        continue
-                    Rs2, ts2, s_terms, s2 = self.stretch(scale, R, t, free)
-                    if s_terms is None or np.any(s2[free] >= MODEL_STRETCH_EDGE * bound[free]):
-                        continue
-                    if (free & ~seen).any() and not self.ends_seen(Rs2, ts2, s2)[free & ~seen].all():
-                        continue
-                    tries.append(self.polish(s2, Rs2, ts2, s_terms))
+                jobs = [(scale, R, t, terms, None, seen)]
+                jobs += [(scale, R, t, terms, free, seen)
+                         for free in ([seen, spanned] if (spanned & ~seen).any() else [seen]) if free.any()]
+                # Independent tries, FIT_WORKERS at a time, in this order.
+                tries = [tried for tried in fit_jobs(self, "proportions", jobs, 2) if tried is not None]
                 Rp, tp, p_terms, p_scale = min(tries, key=lambda r: r[2]["cost"])
                 if p_terms["cost"] < terms["cost"] - MODEL_STRETCH_MIN_GAIN:
                     R, t, terms, scale = Rp, tp, p_terms, p_scale
@@ -2327,6 +2350,23 @@ class _ModelFit:
         best = min(coarse or results, key=lambda r: r[0]["cost"])
         return best
 
+    def proportions_try(self, scale, R, t, terms, free, seen):
+        """One try at the part's proportions in run(): with `free` None, the
+        pose's descent with its scale free along each box axis; else drawn
+        out along the box axes `free` (stretch()) and its pose descended
+        after -- None where that reaches the edge of what may be stretched,
+        or draws a length out that `seen` does not, but its ends do not then
+        show. (R, t, terms, scale) as polish() returns them."""
+        if free is None:
+            return self.polish(scale, R, t, terms, free_axes=True)
+        bound = np.broadcast_to(np.asarray(scale, np.float64), (3,)) * MODEL_STRETCH_MAX
+        Rs2, ts2, s_terms, s2 = self.stretch(scale, R, t, free)
+        if s_terms is None or np.any(s2[free] >= MODEL_STRETCH_EDGE * bound[free]):
+            return None
+        if (free & ~seen).any() and not self.ends_seen(Rs2, ts2, s2)[free & ~seen].all():
+            return None
+        return self.polish(s2, Rs2, ts2, s_terms)
+
     def settle_turns(self, terms, R, t, scale, quality):
         """(terms, R, t, scale, quality, doubts): the pose, or the mesh turned
         onto its own box (ObjectModel.box_turns) where the view tells that
@@ -2354,6 +2394,7 @@ class _ModelFit:
             return max(MODEL_TURN_COST_SLACK, left(way) + left(other))
 
         ways = [(terms, R, t, quality)]
+        jobs = []
         for P in self.model.box_turns:
             values, vectors = np.linalg.eig(P)
             axis = np.real(vectors[:, np.argmin(np.abs(values - 1))])
@@ -2363,13 +2404,15 @@ class _ModelFit:
             if np.any(np.maximum(extent[to], extent) > MODEL_DOUBT_SIDES * np.minimum(extent[to], extent)):
                 continue
             R2 = R @ B @ P @ B.T
-            R2, t2, terms2 = self.icp(scale, R2, centre - R2 @ (M @ c), MODEL_FINE_ROUNDS, MODEL_SAMPLES,
-                                      MODEL_FINE_POINTS, 2 * self.tol)
             # A half turn is polished whatever its first refit costs (MODEL_DOUBT_HALF_TURNS).
             half = MODEL_DOUBT_HALF_TURNS and np.allclose(np.abs(P), np.eye(3))
-            if terms2 is None or (not half and terms2["cost"] > terms["cost"] + 2 * margin(ways[0], ways[0])):
+            jobs.append((scale, R2, centre - R2 @ (M @ c), terms["cost"] + 2 * margin(ways[0], ways[0]), half))
+        # Each way round refitted and polished on its own, FIT_WORKERS at a
+        # time; taken in this order (_turn_start()).
+        for turned in fit_jobs(self, "turn", jobs, 2):
+            if turned is None:
                 continue
-            R2, t2, terms2, _ = self.polish(scale, R2, t2, terms2)
+            R2, t2, terms2, _ = turned
             quality2 = ("fit" if not model_pose_rejection(terms2)
                         else "coarse" if not model_pose_rejection(terms2, coarse=True) else None)
             if quality2 is not None and not any(alike(way[1], R2) for way in ways):
@@ -2473,11 +2516,13 @@ class _ModelFit:
         proportions = np.asarray(scale, np.float64) / _overall(scale)
         lo, hi = MODEL_SCALE_RANGE
 
-        def fit(s, R0, mesh_n, obs_n):
-            shape = s * proportions if np.ndim(proportions) else s
-            Rs, ts, terms = self.icp(shape, R0, centre - R0 @ (self.linear(shape) @ mean),
-                                     MODEL_SCALE_ROUNDS, mesh_n, obs_n, 2 * self.tol)
-            return (s, Rs, ts, terms) if terms is not None else None
+        def fits(scales, R0, mesh_n, obs_n):
+            # Each scale re-fit on its own, FIT_WORKERS at a time, in this order.
+            shapes = [s * proportions if np.ndim(proportions) else s for s in scales]
+            jobs = [(shape, R0, centre - R0 @ (self.linear(shape) @ mean), MODEL_SCALE_ROUNDS, mesh_n, obs_n,
+                     2 * self.tol) for shape in shapes]
+            return [(s, Rs, ts, terms) for s, (Rs, ts, terms) in zip(scales, fit_jobs(self, "icp", jobs, 4))
+                    if terms is not None]
 
         # A bracket about the start's size, moved on while its best is at
         # its end: the start is near the size, and the range is wide.
@@ -2487,8 +2532,7 @@ class _ModelFit:
         while True:
             steps = np.log(b_hi / b_lo) / np.log(MODEL_SCALE_COARSE_RATIO)
             grid = np.exp(np.linspace(np.log(b_lo), np.log(b_hi), int(np.ceil(steps)) + 1))
-            coarse += [r for r in (fit(s, R, *MODEL_COARSE[:2]) for s in grid
-                                   if round(float(np.log(s)), 6) not in tried) if r is not None]
+            coarse += fits([s for s in grid if round(float(np.log(s)), 6) not in tried], R, *MODEL_COARSE[:2])
             tried.update(round(float(np.log(s)), 6) for s in grid)
             if not coarse:
                 return 1.0, scale, R, t, None, False
@@ -2507,15 +2551,193 @@ class _ModelFit:
         # Re-fit about the best coarse scale with every point, out to the
         # neighbouring grid scales.
         k = int(np.ceil(np.log(MODEL_SCALE_COARSE_RATIO) / np.log(MODEL_SCALE_FINE_RATIO)))
-        fine = [r for r in (fit(float(np.clip(s0 * MODEL_SCALE_FINE_RATIO ** i, lo, hi)), R0,
-                                MODEL_SAMPLES, MODEL_FINE_POINTS) for i in range(-k, k + 1))
-                if r is not None]
+        fine = fits([float(np.clip(s0 * MODEL_SCALE_FINE_RATIO ** i, lo, hi)) for i in range(-k, k + 1)], R0,
+                    MODEL_SAMPLES, MODEL_FINE_POINTS)
         if not fine:
             return 1.0, scale, R, t, None, False
         s, Rs, ts, terms = min(fine, key=lambda r: r[3]["cost"])
         edge = s <= lo * MODEL_SCALE_FINE_RATIO or s >= hi / MODEL_SCALE_FINE_RATIO
         shape = s * proportions if np.ndim(proportions) else s
         return s, shape, Rs, ts, terms, edge
+
+
+# The pose search's starts (_ModelFit.run(), _quick_fit()) are independent:
+# each is placed and fitted by ICP on its own, and only their results are
+# compared after. They are fitted FIT_WORKERS at a time, each worker a process
+# of its own -- a start is numpy calls on a few thousand points, too small for
+# threads to gain under the GIL or for the GPU one at a time -- and their
+# results are taken in the order the starts come, so the fit comes out as
+# fitted one start after another, to the bit. On PP-S1-1 (this machine: Ryzen
+# 5 3600, 6 cores, 12 threads), 45.6 s of the 48.8 s of locating and fitting
+# the init's two meshes was those starts' ICP. 0 or 1: fitted here, as
+# pose_server imported as a module does unless start_fit_pool() is called; the
+# server sets it (--fit-workers).
+FIT_WORKERS = 0
+# The server's --fit-workers default: the CPU's threads less four for the
+# server's own (the track thread, the fit's serial steps between batches), at
+# most 8. Locating and fitting PP-S1-1's two meshes, serial 43.0 s; with 5
+# workers 15.7 s, 8 12.9 s, 11 12.3 s (2026-11-12, this machine's 12 threads).
+FIT_WORKERS_DEFAULT = max(0, min(8, (os.cpu_count() or 1) - 4))
+# Fewer coarse starts than this are fitted here: the view (some 10 MB) goes to
+# each worker with its share, and costs about as much as a dozen of them.
+FIT_PARALLEL_MIN = 8
+# The workers all start with the server; a worker that has not imported in this
+# long fails the start, and the server fits here instead.
+FIT_POOL_START_S = 120.0
+# Independent fits made at once, each on a thread of its own (side_by_side()):
+# the proposals a locate fits, the parts an init fits. One fit at a time kept
+# 3-4 of the 6 cores busy, its in-process steps leaving the workers idle
+# (2026-11-12, PP-S1-2 / RI-S2-1).
+FIT_SIDE_BY_SIDE = 4
+# What the pose search does not read, left out of the worker's copy of a fit:
+# the frame in CIELAB (7 MB) and the observed box's points. The depth is the
+# camera points' third column, made again there.
+_FIT_UNSHIPPED = ("lab", "_obb_points", "_obb", "depth")
+# Left out of a coarse start's terms: the point arrays only the next ICP step
+# reads. A coarse start's result is compared by its scores alone.
+_FIT_POINT_TERMS = ("pairs", "P", "below")
+_fit_pool = None
+_fit_pool_workers = 0
+_fit_pool_lock = threading.Lock()
+
+
+def _coarse_start(fit, s, R, mesh_n, obs_n, rounds):
+    """One start of the coarse pose search: placed, fitted, and its terms' scores."""
+    t = fit.place(s, R, mesh_n)
+    R, t, terms = fit.icp(s, R, t, rounds, mesh_n, obs_n, MODEL_SEARCH_M)
+    if terms is not None:
+        terms = {k: v for k, v in terms.items() if k not in _FIT_POINT_TERMS}
+    return R, t, terms
+
+
+def _icp_start(fit, s, R, t, rounds, mesh_n, obs_n, radius):
+    return fit.icp(s, R, t, rounds, mesh_n, obs_n, radius)
+
+
+def _turn_start(fit, scale, R, t, most, half):
+    """One way round of settle_turns(): refitted, and polished unless it
+    costs more than `most` (a half turn always is); None where not."""
+    R, t, terms = fit.icp(scale, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * fit.tol)
+    if terms is None or (not half and terms["cost"] > most):
+        return None
+    return fit.polish(scale, R, t, terms)
+
+
+_FIT_JOBS = {"coarse": _coarse_start, "icp": _icp_start, "turn": _turn_start,
+             "proportions": lambda fit, *job: fit.proportions_try(*job)}
+
+
+def _fit_worker_init(server_pid):
+    """A worker dies with the server, however the server ends: stopped by
+    pkill (SIGTERM, which runs no finally, so no stop_fit_pool()) or killed,
+    the workers were left waiting for work, 95 MB each (2026-11-12). Linux
+    kills it when the thread that started it ends -- the server's main
+    thread, which starts every worker (start_fit_pool())."""
+    try:
+        import ctypes
+        import signal
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL))
+    except Exception:
+        pass
+    if os.getppid() != server_pid:             # gone before the above took
+        os._exit(0)
+
+
+def _fit_worker_ready():
+    """A worker's pid, and whether it imported torch (it should not)."""
+    return os.getpid(), "torch" in sys.modules
+
+
+def _fit_worker_run(blob, kind, jobs):
+    fit = pickle.loads(blob)
+    fit.depth = fit.cam[..., 2]
+    return [_FIT_JOBS[kind](fit, *job) for job in jobs]
+
+
+def start_fit_pool(workers):
+    """Start `workers` fit worker processes (FIT_WORKERS), all now; the
+    number started, 0 where none could be and the fits stay here. Spawned,
+    not forked: a fork of a process holding CUDA cannot use it, nor be sure
+    of anything else the server's threads hold."""
+    global _fit_pool, _fit_pool_workers, FIT_WORKERS
+    workers = int(workers)
+    if workers <= 1 or _fit_pool is not None:
+        return _fit_pool_workers
+    started = time.time()
+    # Each worker takes the environment it starts in: no GPU, one BLAS thread
+    # (a worker's share of the starts is its whole core), and the flag that
+    # leaves torch and the pipeline out of its import (IN_FIT_WORKER).
+    env = {FIT_WORKER_ENV: "1", "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1",
+           "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    saved = {k: os.environ.get(k) for k in env}
+    pool = None
+    try:
+        os.environ.update(env)
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                                   initializer=_fit_worker_init, initargs=(os.getpid(),))
+        # A submit with no worker idle starts one: these start every worker now,
+        # in the environment above.
+        ready = [pool.submit(_fit_worker_ready) for _ in range(workers)]
+    except Exception as exc:
+        print(f"[server] fit workers not started ({type(exc).__name__}: {exc}); fitting here", flush=True)
+        ready = []
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    try:
+        replies = [f.result(timeout=FIT_POOL_START_S) for f in ready]
+    except Exception as exc:
+        print(f"[server] fit workers not started ({type(exc).__name__}: {exc}); fitting here", flush=True)
+        replies = []
+    if not replies:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        return 0
+    if any(torch_loaded for _, torch_loaded in replies):
+        print("[server] WARNING: a fit worker imported torch; each holds some 450 MB instead of 110", flush=True)
+    _fit_pool, _fit_pool_workers, FIT_WORKERS = pool, workers, workers
+    print(f"[server] {workers} fit workers started in {time.time() - started:.1f} s", flush=True)
+    return workers
+
+
+def stop_fit_pool():
+    global _fit_pool, _fit_pool_workers, FIT_WORKERS
+    with _fit_pool_lock:
+        pool, _fit_pool, _fit_pool_workers, FIT_WORKERS = _fit_pool, None, 0, 0
+    if pool is not None:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def fit_jobs(fit, kind, jobs, min_jobs=FIT_PARALLEL_MIN):
+    """Each of `jobs` (argument tuples) done by _FIT_JOBS[kind] on `fit`, in
+    order: shared among the fit workers where there are at least `min_jobs`
+    (FIT_WORKERS), else here -- the same results either way. A pool that has
+    broken (a worker killed) is given up, and the fits are done here."""
+    global _fit_pool, _fit_pool_workers, FIT_WORKERS
+    jobs = list(jobs)
+    run = _FIT_JOBS[kind]
+    pool, workers = _fit_pool, _fit_pool_workers
+    if pool is None or len(jobs) < max(2, min_jobs):
+        return [run(fit, *job) for job in jobs]
+    copy_ = object.__new__(_ModelFit)
+    copy_.__dict__.update({k: v for k, v in fit.__dict__.items() if k not in _FIT_UNSHIPPED})
+    blob = pickle.dumps(copy_, protocol=pickle.HIGHEST_PROTOCOL)
+    # Consecutive shares, about equal: a start's cost is set by its rounds and points.
+    bounds = np.linspace(0, len(jobs), min(workers, len(jobs)) + 1).round().astype(int)
+    try:
+        futures = [pool.submit(_fit_worker_run, blob, kind, jobs[a:b]) for a, b in zip(bounds[:-1], bounds[1:])]
+        return [result for future in futures for result in future.result()]
+    except BrokenProcessPool as exc:
+        with _fit_pool_lock:
+            if _fit_pool is pool:
+                _fit_pool, _fit_pool_workers, FIT_WORKERS = None, 0, 0
+                print(f"[server] fit workers lost ({exc}); fitting here from now on", flush=True)
+        pool.shutdown(wait=False, cancel_futures=True)
+        return [run(fit, *job) for job in jobs]
 
 
 def model_pose_rejection(terms, coarse=False):
@@ -3627,14 +3849,17 @@ def _quick_fit(model, view, K, screen=False, through=None, image=None):
     if model.known_scale is None and not any(np.ndim(s) == 0 and np.isclose(s, observed) for s in starts):
         starts.append(observed)
     best = uniform = None
+    scales, jobs = [], []
     for s in starts:
         for R in fit.candidates(on_support=not screen):
-            t = fit.place(s, R, mesh_n)
-            R, t, terms = fit.icp(s, R, t, rounds, mesh_n, obs_n, MODEL_SEARCH_M)
-            if terms is not None and (best is None or terms["cost"] < best[0]):
-                best = (terms["cost"], R, t, s, terms)
-            if terms is not None and np.ndim(s) == 0 and (uniform is None or terms["cost"] < uniform[0]):
-                uniform = (terms["cost"], R, t, s, terms)
+            scales.append(s)
+            jobs.append((s, R, mesh_n, obs_n, rounds))
+    # Independent starts, fitted FIT_WORKERS at a time, in this order.
+    for s, (R, t, terms) in zip(scales, fit_jobs(fit, "coarse", jobs)):
+        if terms is not None and (best is None or terms["cost"] < best[0]):
+            best = (terms["cost"], R, t, s, terms)
+        if terms is not None and np.ndim(s) == 0 and (uniform is None or terms["cost"] < uniform[0]):
+            uniform = (terms["cost"], R, t, s, terms)
     if best is None:
         return None
 
@@ -3646,19 +3871,22 @@ def _quick_fit(model, view, K, screen=False, through=None, image=None):
     _, R, t, s, terms = best
     if screen:
         return scored(R, t, s, terms)
-    R, t, terms = fit.icp(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * fit.tol)
-    found = [scored(R, t, s, terms)] if terms is not None else []
+    # The best start refined, and the best at one scale fitted again at scales
+    # about it: independent, fitted FIT_WORKERS at a time, in this order.
+    jobs = [(s, R, t, MODEL_FINE_ROUNDS, MODEL_SAMPLES, MODEL_FINE_POINTS, 2 * fit.tol)]
+    scales = [s]
     if uniform is not None and model.known_scale is None:
-        _, R, t, s, _ = uniform
+        _, Ru, tu, su, _ = uniform
         mean = model.points.mean(0)
-        centre = R @ (s * mean) + t
+        centre = Ru @ (su * mean) + tu
         span = np.log(MODEL_SCALE_START_RATIO)
         for ratio in np.exp(np.linspace(-span, span, LOCATE_SCALE_STEPS)):
-            si = float(np.clip(s * ratio, *MODEL_SCALE_RANGE))
-            Ri, ti, termsi = fit.icp(si, R, centre - R @ (si * mean), MODEL_FINE_ROUNDS, MODEL_SAMPLES,
-                                     MODEL_FINE_POINTS, 2 * fit.tol)
-            if termsi is not None:
-                found.append(scored(Ri, ti, si, termsi))
+            si = float(np.clip(su * ratio, *MODEL_SCALE_RANGE))
+            jobs.append((si, Ru, centre - Ru @ (si * mean), MODEL_FINE_ROUNDS, MODEL_SAMPLES,
+                         MODEL_FINE_POINTS, 2 * fit.tol))
+            scales.append(si)
+    found = [scored(Ri, ti, si, termsi) for si, (Ri, ti, termsi) in zip(scales, fit_jobs(fit, "icp", jobs, 2))
+             if termsi is not None]
     if found and not max(found, key=lambda item: item[0])[0][0] and model.known_scale is None:
         _, (R, t, s) = max(found, key=lambda item: item[0])
         terms = fit.terms(s, R, t, MODEL_SAMPLES, MODEL_FINE_POINTS)
@@ -3848,7 +4076,7 @@ class NeedClick(Exception):
 
 
 def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None, robot=None, why=None,
-                     rest=False, scales=None, grown=None, image=None):
+                     rest=False, scales=None, grown=None, image=None, kept=None):
     """Where in the view an object is, by its mesh: (click, region, note,
     (score, overall scale, scale)), the click as mesh_click() gives it and the
     model fitted, or (None, None, reason, None). With `scales`, a range of
@@ -3860,7 +4088,7 @@ def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None, robot=
     became of it) for each proposal. `grown`, `taken` with the located parts
     grown (LOCATE_REGION_GROW_PX), is what a proposal loses of them where it
     is not mostly on them so and, with `rest`, enough is left; else `taken`
-    itself."""
+    itself. `kept`, the fits already made, for _kept_quick_fits()."""
     why = [] if why is None else why
     f = float(K[0, 0])
     m = np.sort(model.extent)[::-1]
@@ -3889,7 +4117,7 @@ def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None, robot=
     fitted = []
 
     def fit_among(candidates, said_too=""):
-        return _locate_fits(model, K, candidates, scales, why, said_too, throughs, image, fitted)
+        return _locate_fits(model, K, candidates, scales, why, said_too, throughs, image, fitted, kept)
 
     def measured(region, through=None):
         """(view, its two longest extents, longest first), or (None, why not)."""
@@ -4016,41 +4244,109 @@ def locate_with_mesh(model, proposals, metres, K, clicked=(), taken=None, robot=
     return found[0], found[1], note, (score, _overall(pose[2]), pose[2], [(c, s) for c, _, s in rivals])
 
 
-def _locate_fits(model, K, candidates, scales, why, said_too="", throughs=None, image=None, fitted=None):
+def side_by_side(calls, most=None):
+    """Each of `calls` (no-argument callables) made at once, up to `most`
+    (FIT_SIDE_BY_SIDE) at a time, on threads of their own: (result,
+    exception or None, seconds) of each, in order. The fits share the fit
+    workers (fit_jobs(), thread-safe), and each is what it is alone."""
+    def made(call):
+        started = time.time()
+        try:
+            return call(), None, time.time() - started
+        except Exception as exc:
+            return None, exc, time.time() - started
+    if len(calls) < 2:
+        return [made(call) for call in calls]
+    with ThreadPoolExecutor(max_workers=min(len(calls), most or FIT_SIDE_BY_SIDE),
+                            thread_name_prefix="fit_side_by_side") as pool:
+        return list(pool.map(made, calls))
+
+
+def _digest(*items):
+    """A hash of `items` by content: arrays (dtype, shape, values), and
+    tuples, lists, numbers, strings and None in them."""
+    h = hashlib.blake2b(digest_size=16)
+
+    def feed(item):
+        if isinstance(item, np.ndarray):
+            h.update(f"a{item.dtype.str}{item.shape}".encode())
+            h.update(np.ascontiguousarray(item).tobytes())
+        elif isinstance(item, (tuple, list)):
+            h.update(f"t{len(item)}".encode())
+            for part in item:
+                feed(part)
+        else:
+            h.update(f"v{type(item).__name__}:{item!r};".encode())
+    for item in items:
+        feed(item)
+    return h.digest()
+
+
+def _kept_quick_fits(kept, model, K, items, screen=False, image=None):
+    """_quick_fit() of each (view, through) of `items`, those not made yet
+    side by side (side_by_side()), or None where one failed. `kept`, one
+    locate's fits by their inputs (locate_unclicked()), or None: a later
+    round sees most proposals as the one before did, and their fits,
+    deterministic, come out the same -- RR-S1-1 and HS-S1-1 fitted 9 of
+    theirs twice over (2026-11-12). Each gets a copy, its own object as if
+    fitted afresh: locate_with_mesh() tells fits apart by identity."""
+    kept = kept if kept is not None else types.SimpleNamespace(done={}, reused=0)
+    keys = [(id(model), screen, _digest(view, K, through, image)) for view, through in items]
+    new = {}
+    for key, (view, through) in zip(keys, items):
+        if key in kept.done or key in new:
+            kept.reused += 1
+        else:
+            new[key] = functools.partial(_quick_fit, model, view, K, screen=screen, through=through,
+                                         image=image)
+    failed = {}
+    for key, (found, exc, _) in zip(new, side_by_side(list(new.values()))):
+        if exc is None:
+            kept.done[key] = found
+        else:
+            failed[key] = exc
+    results = []
+    for key in keys:
+        if key in failed:
+            traceback.print_exception(failed[key])
+            results.append(None)
+        else:
+            results.append(copy.deepcopy(kept.done[key]))
+    return results
+
+
+def _locate_fits(model, K, candidates, scales, why, said_too="", throughs=None, image=None, fitted=None,
+                 kept=None):
     """(best fit or None, proposals fitted, screened, the best's proposal) of
     `candidates` [(miss, index, view)] (locate_with_mesh()): rough fits rank
     them, the best LOCATE_FITS are fitted properly; `why` is told of each.
     `throughs`, by index, what joins a candidate's pieces (_quick_fit());
-    `fitted`, a list, is given each proper fit within `scales`."""
+    `fitted`, a list, is given each proper fit within `scales`; `kept`, the
+    fits already made (_kept_quick_fits()). The rough fits are made side by
+    side, then the proper ones."""
     throughs = throughs or {}
     screened, chosen = [], None
-    for rank, (_, index, view) in enumerate(sorted(candidates, key=lambda item: item[0])):
-        if rank >= LOCATE_SCREENS:
-            why.append((index, "shortlisted, past the screening cap"))
-            continue
-        try:
-            found = _quick_fit(model, view, K, screen=True, through=throughs.get(index), image=image)
-        except Exception:
-            traceback.print_exc()
-            found = None
+    ranked = sorted(candidates, key=lambda item: item[0])
+    for _, index, _ in ranked[LOCATE_SCREENS:]:
+        why.append((index, "shortlisted, past the screening cap"))
+    ranked = ranked[:LOCATE_SCREENS]
+    roughs = _kept_quick_fits(kept, model, K, [(view, throughs.get(index)) for _, index, view in ranked],
+                              screen=True, image=image)
+    for (_, index, view), found in zip(ranked, roughs):
         if found is None:
             why.append((index, "shortlisted, no rough fit"))
             continue
         within = scales is None or scales[0] <= _overall(found[1][2]) <= scales[1]
         screened.append(((within,) + found[0], index, view))
     screened.sort(key=lambda item: item[0], reverse=True)
-    best, tried = None, 0
-    for rank, ((_, accepted, rough), index, view) in enumerate(screened):
+    for (_, accepted, rough), index, _ in screened[LOCATE_FITS:]:
+        why.append((index, f"rough fit {rough:.2f}" + ("" if accepted else " refused")))
+    top = screened[:LOCATE_FITS]
+    fines = _kept_quick_fits(kept, model, K, [(view, throughs.get(index)) for _, index, view in top],
+                             image=image)
+    best, tried = None, len(top)
+    for ((_, accepted, rough), index, view), found in zip(top, fines):
         said = f"rough fit {rough:.2f}" + ("" if accepted else " refused")
-        if rank >= LOCATE_FITS:
-            why.append((index, said))
-            continue
-        tried += 1
-        try:
-            found = _quick_fit(model, view, K, through=throughs.get(index), image=image)
-        except Exception:
-            traceback.print_exc()
-            found = None
         if found is None:
             why.append((index, f"{said}, no fit"))
             continue
@@ -4182,11 +4478,13 @@ class PoseServer:
 
     def release_pipeline(self):
         """Drop the pipeline and its GPU memory before another is built: built
-        first, the new one's models load beside the old ones, and an 8 GB card
-        then spills into system memory, where a frame takes tens of seconds."""
+        first, the new one's state lands beside the old one's, and an 8 GB card
+        then spills into system memory, where a frame takes tens of seconds.
+        The SAM2 and TAPIR models stay, for the next pipeline (keep_models)."""
         self.pipeline = None
         # A fit still running belongs to the old session; stop waiting on it.
         self.mesh_fit_job = None
+        Sam2RealTimeSegmenter.drop_kept_state()
         gc.collect()
         # The SAM2 segmenter enters a bf16 autocast at import and never leaves
         # it, so autocast's cache of cast weights is never cleared and keeps
@@ -4210,7 +4508,7 @@ class PoseServer:
         release): what an earlier session left behind; traced, what holds it."""
         if not torch.cuda.is_available():
             return
-        held = torch.cuda.memory_allocated() / 2**20
+        held = torch.cuda.memory_allocated() / 2**20 - kept_model_mib()
         if held <= GPU_HELD_WARN_MIB:
             return
         print(f"[server] WARNING: {held:.0f} MiB of GPU memory still allocated {when}, held from an earlier "
@@ -4262,7 +4560,8 @@ class PoseServer:
     def log_gpu_memory(self, when):
         if torch.cuda.is_available():
             print(f"[server] GPU memory {when}: "
-                  f"allocated {torch.cuda.memory_allocated() / 2**20:.0f} MiB, "
+                  f"allocated {torch.cuda.memory_allocated() / 2**20:.0f} MiB "
+                  f"({kept_model_mib():.0f} MiB of it kept models), "
                   f"reserved {torch.cuda.memory_reserved() / 2**20:.0f} MiB", flush=True)
 
     def build_pipeline(self):
@@ -4334,7 +4633,7 @@ class PoseServer:
         try:
             # Same call as a preview, made on the freshly built pipeline before
             # add_user_points(), which is the state a preview sees.
-            logits = self.pipeline.preview_user_masks(rgb, points, labels)
+            logits = self.preview_masks(rgb, points, labels)
             masks = (as_numpy(logits) > 0).reshape(len(points), *metres.shape).copy()
         except Exception:
             self.say("no init masks; mesh objects rejected, no boxes")
@@ -4353,14 +4652,23 @@ class PoseServer:
                 masks[index] &= ~cut[index]
             if robot is not None:
                 masks[index] &= ~robot
-        boxes = []
-        for index, mask in enumerate(masks):
-            fit = None
+        views = []
+        for mask in masks:
             try:
-                view = observe(mask, metres, K)
+                views.append(observe(mask, metres, K))
             except Exception:
                 traceback.print_exc()
-                view = None
+                views.append(None)
+        # The parts' fits are independent: made side by side (FIT_SIDE_BY_SIDE).
+        fitting = [index for index, view in enumerate(views)
+                   if self.model_required[index] and models[index] is not None and view is not None]
+        fits = dict(zip(fitting, side_by_side([functools.partial(
+            fit_model_box, models[index], views[index], K, through=cut[index],
+            scale_hint=self.scale_hints[index], located=getattr(self, "locate_shapes", {}).get(index),
+            image=rgb, known_shape=self.shape_hints[index]) for index in fitting])))
+        boxes = []
+        for index, mask in enumerate(masks):
+            fit, view = None, views[index]
             if self.model_required[index] and models[index] is None:
                 self.model_errors[index] = "supplied mesh could not be loaded"
                 self.say(f"object {index}: supplied mesh could not be loaded; tracking its points' box")
@@ -4370,21 +4678,18 @@ class PoseServer:
                     except Exception:
                         traceback.print_exc()
             elif self.model_required[index]:
-                started = time.time()
-                reason = "no usable initial depth observation"
+                reason, seconds = "no usable initial depth observation", 0.0
                 if view is not None:
-                    try:
-                        fit, reason = fit_model_box(models[index], view, K, through=cut[index],
-                                                    scale_hint=self.scale_hints[index],
-                                                    located=getattr(self, "locate_shapes", {}).get(index),
-                                                    image=rgb, known_shape=self.shape_hints[index])
-                    except Exception as exc:
-                        traceback.print_exc()
+                    found, exc, seconds = fits[index]
+                    if exc is None:
+                        fit, reason = found
+                    else:
+                        traceback.print_exception(exc)
                         reason = f"{type(exc).__name__}: {exc}"
                 self.model_retry_after[index] = time.monotonic() + MODEL_RETRY_INTERVAL_SEC
                 if fit is None:
                     self.model_errors[index] = reason
-                    self.say(f"object {index}: mesh pose unlocalized in {time.time() - started:.1f} s "
+                    self.say(f"object {index}: mesh pose unlocalized in {seconds:.1f} s "
                              f"({reason}); tracking its points' box, retrying the mesh on fresh frames")
                     if view is not None:
                         try:
@@ -4394,7 +4699,7 @@ class PoseServer:
                 else:
                     self.fitted_models[index] = models[index]
                     self.remember_scale(models[index])
-                    self.say(f"object {index}: mesh fit in {time.time() - started:.1f} s")
+                    self.say(f"object {index}: mesh fit in {seconds:.1f} s")
             elif view is not None:
                 try:
                     fit = fit_box(mask, metres, K, view=view)
@@ -5475,6 +5780,28 @@ class PoseServer:
     def handle_init(self, meta, parts):
         started = time.time()
         self.init_report = []
+        # The init's SAM2 previews by their inputs (preview_masks()).
+        self.init_previews = {}
+        try:
+            return self.init_session(meta, parts, started)
+        finally:
+            self.init_previews = None
+
+    def preview_masks(self, rgb, points, labels):
+        """The pipeline's preview_user_masks(), made once in an init for each
+        set of inputs: separating the parts, finding obstacles and fitting
+        the boxes ask for the same (~0.55 s each, 2026-11-12). A preview
+        starts the segmenter afresh (load_first_frame()), so it is the same
+        whenever it is made."""
+        previews = getattr(self, "init_previews", None)
+        if previews is None:
+            return self.pipeline.preview_user_masks(rgb, points, labels)
+        key = _digest(rgb, points, labels)
+        if key not in previews:
+            previews[key] = self.pipeline.preview_user_masks(rgb, points, labels)
+        return previews[key]
+
+    def init_session(self, meta, parts, started):
         self.build_pipeline()
         rgb = decode_rgb(parts[0])
         depth = decode_depth(parts[1], meta).astype(np.float32)
@@ -5583,6 +5910,8 @@ class PoseServer:
             return points, labels, {}
         started = time.time()
         proposals, sources, (sam, as_region, regions) = self.proposals(rgb, metres)
+        # The fits made, by their inputs: each round looks at every proposal again.
+        fits_made = types.SimpleNamespace(done={}, reused=0)
         if proposals is None:
             raise RuntimeError("the segmenter offers no mask proposals; click every object")
 
@@ -5620,7 +5949,7 @@ class PoseServer:
                 why = []
                 click, region, note, fit = locate_with_mesh(models[index], proposals, metres, K,
                                                             clicked, taken, robot, why, rest, grown=grown,
-                                                            image=rgb)
+                                                            image=rgb, kept=fits_made)
                 for which, said in sorted(why):
                     self.say(f"  object {index}{f' (round {round_})' if round_ > 1 else ''}"
                              f"{', what is left of proposals' if rest else ''}, {sources[which]} "
@@ -5675,7 +6004,8 @@ class PoseServer:
             # holding the bar, and is what is left of it once the bar is located.
             click, region, note, fit = locate_with_mesh(
                 models[index], proposals, metres, K, clicked, others, robot, why, True,
-                (at / LOCATE_SCALE_AGREE, at * LOCATE_SCALE_AGREE), grown=others_grown, image=rgb)
+                (at / LOCATE_SCALE_AGREE, at * LOCATE_SCALE_AGREE), grown=others_grown, image=rgb,
+                kept=fits_made)
             for which, said in sorted(why):
                 self.say(f"  object {index}, again at the others' scale {at:.2f}, {sources[which]} "
                          f"({describe_proposal(proposals[which])}): {said}")
@@ -5709,7 +6039,7 @@ class PoseServer:
             click, region, note, fit = locate_with_mesh(
                 models[index], proposals, metres, K, clicked, taken_now, robot, why, True,
                 (at / LOCATE_SCALE_AGREE, at * LOCATE_SCALE_AGREE) if self.same_scale else None, grown=grown_now,
-                image=rgb)
+                image=rgb, kept=fits_made)
             if click is None or fit[0] < score + LOCATE_BETTER:
                 continue
             for which, said in sorted(why):
@@ -5725,7 +6055,8 @@ class PoseServer:
                      f"{score:.2f} ({note})")
         self.locate_scales = {index: fit[1] for index, fit in fitted.items()}
         self.locate_shapes = shapes
-        self.say(f"located by mesh in {time.time() - started:.1f} s")
+        self.say(f"located by mesh in {time.time() - started:.1f} s "
+                 f"({len(fits_made.done)} fits made, {fits_made.reused} reused)")
         # Located, but not for sure: weakly, or as well somewhere else.
         for index, (score, scale, _) in fitted.items():
             here = [points[index]]
@@ -5752,7 +6083,7 @@ class PoseServer:
             return points, labels
         try:
             h, w = rgb.shape[:2]
-            masks = (as_numpy(self.pipeline.preview_user_masks(rgb, points, labels)) > 0).reshape(len(points), h, w)
+            masks = (as_numpy(self.preview_masks(rgb, points, labels)) > 0).reshape(len(points), h, w)
         except Exception as exc:
             self.say(f"parts not checked for one segment holding two ({type(exc).__name__}: {exc})")
             return points, labels
@@ -5789,7 +6120,7 @@ class PoseServer:
         for region in located.values():
             taken |= region
         try:
-            logits = self.pipeline.preview_user_masks(rgb, points, labels)
+            logits = self.preview_masks(rgb, points, labels)
             taken |= np.any((as_numpy(logits) > 0).reshape(len(points), *metres.shape), axis=0)
         except Exception as exc:
             self.say(f"obstacles: no segments of the parts ({type(exc).__name__}: {exc}); "
@@ -6165,7 +6496,13 @@ if __name__ == "__main__":
                     help="keep where each live GPU block was allocated, and say it, with what holds it, when a "
                          f"release leaves more than {GPU_HELD_WARN_MIB} MiB allocated; the memory is logged every "
                          f"{GPU_TRACE_EVERY_FRAMES} track frames too (see GPU_HELD_WARN_MIB)")
+    ap.add_argument("--fit-workers", type=int, default=FIT_WORKERS_DEFAULT,
+                    help="processes the mesh pose search's starts are shared among (see FIT_WORKERS); "
+                         f"0 or 1 fits in the server's own process (default {FIT_WORKERS_DEFAULT})")
     args = ap.parse_args()
+    # Before the pipeline: the workers start from a fresh interpreter (spawned),
+    # so nothing the server loads is copied into them either way.
+    start_fit_pool(args.fit_workers)
     server = PoseServer(args.config, args.bind, archive=args.archive, trace_gpu=args.trace_gpu_memory)
     try:
         server.run()
@@ -6174,3 +6511,4 @@ if __name__ == "__main__":
         server.archive_session()
         if server.mesh_fit_executor is not None:
             server.mesh_fit_executor.shutdown(wait=True, cancel_futures=True)
+        stop_fit_pool()

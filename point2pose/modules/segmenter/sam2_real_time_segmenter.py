@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 
@@ -17,6 +19,21 @@ if torch.cuda.is_available():
 
 @SEGMENTER.register_module("sam2")
 class Sam2RealTimeSegmenter(Segmenter):
+    # Keep each built predictor for later segmenters of the same model, so a
+    # process that rebuilds its pipeline (pose_server, on every init) loads
+    # the weights once (~2.6 s each time otherwise). Off by default.
+    keep_models = False
+    _kept = {}
+
+    @classmethod
+    def drop_kept_state(cls):
+        """Clear the kept predictors' tracking state, as their constructor
+        leaves it: the last segmenter's objects, frames and memory are in
+        condition_state (~250 MiB of GPU) and track() counts from frame_idx."""
+        for predictor in cls._kept.values():
+            predictor.condition_state = {}
+            predictor.frame_idx = 0
+
     def __init__(self, config):
         super().__init__(config)
         self.name = "sam2_real_time"
@@ -27,10 +44,17 @@ class Sam2RealTimeSegmenter(Segmenter):
             "checkpoint", "checkpoints/sam2.1/sam2.1_hiera_large.pt"
         )
 
-        self.predictor = build_sam2_camera_predictor(
-            model_cfg,
-            checkpoint,
-        )
+        key = (model_cfg, os.path.abspath(checkpoint))
+        self.predictor = self._kept.get(key) if self.keep_models else None
+        if self.predictor is None:
+            self.predictor = build_sam2_camera_predictor(
+                model_cfg,
+                checkpoint,
+            )
+            if self.keep_models:
+                Sam2RealTimeSegmenter._kept[key] = self.predictor
+        else:
+            self.drop_kept_state()
 
         # Pending prompt objects. Each entry groups the clicks for a single object,
         # e.g. {"points": [[x, y], ...], "labels": [1/0, ...]}. Multiple positive

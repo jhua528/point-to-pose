@@ -33,6 +33,12 @@ class TapirTracker(Tracker):
     TAPIR performs 2D point tracking in RGB image streams.
     """
 
+    # Keep each loaded model for later trackers of the same settings, so a
+    # process that rebuilds its pipeline (pose_server, on every init) loads
+    # the weights once. Off by default.
+    keep_models = False
+    _kept = {}
+
     def __init__(self, config):
         super().__init__(config)
         self.name = "tapir"
@@ -54,15 +60,20 @@ class TapirTracker(Tracker):
             "checkpoint_path", "causal_bootstapir_checkpoint.pt"
         )
 
-        # TAPIR model
-        self._model = tapir_model.TAPIR(
-            pyramid_level=1,
-            use_casual_conv=True,
-            num_pips_iter=self._num_pips_iter,
-        )
-        self._model.load_state_dict(torch.load(checkpoint_path))
-        self._model = self._model.to(self._device)
-        self._model = self._model.eval()
+        # TAPIR model (it holds no tracking state: that is the tracker's own)
+        key = (os.path.abspath(checkpoint_path), self._num_pips_iter, str(self._device))
+        self._model = self._kept.get(key) if self.keep_models else None
+        if self._model is None:
+            self._model = tapir_model.TAPIR(
+                pyramid_level=1,
+                use_casual_conv=True,
+                num_pips_iter=self._num_pips_iter,
+            )
+            self._model.load_state_dict(torch.load(checkpoint_path))
+            self._model = self._model.to(self._device)
+            self._model = self._model.eval()
+            if self.keep_models:
+                TapirTracker._kept[key] = self._model
         # Grad mode is per thread: this turns it off only on the thread that
         # builds the tracker. pose_server's track thread had it on, so each
         # keyframe's add_query_points() kept its feature grids' whole autograd

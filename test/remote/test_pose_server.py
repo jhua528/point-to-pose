@@ -476,3 +476,76 @@ def test_track_answered_stale_while_a_frame_takes_long():
     assert "stale" not in fresh and fresh["frame_id"] == 8
     plain = s.answer_track({"cmd": "track"}, [], time.time())  # a client that says nothing: as before
     assert "stale" not in plain and plain["frame_id"] == 9
+
+
+# 7. The pose search shared among fit worker processes (FIT_WORKERS).
+
+def test_fit_workers_fit_as_one_process_does():
+    """The fit with its starts shared among workers comes out as fitted in
+    one process, to the bit: the starts are independent and taken in order."""
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts/remote"))
+    import pose_server as named               # by a name the workers can import it by
+    v, f = TESTER
+    true_v = v * TESTER_K
+    T = resting(true_v, rot([0, 0, 1], 30.0), 0.02, 0.01)
+    depth, ids = render([(true_v @ T[:3, :3].T + T[:3, 3], f)], seed=5)
+    view = named.observe(ids == 0, depth.astype(np.float64), K)
+
+    def fitted():
+        model = named.ObjectModel(v, f)
+        fit, reason = named.fit_model_box(model, view, K)
+        assert fit is not None, reason
+        return fit, model.fitted_pose, model.fitted_linear, model.fitted_doubts, model.fitted_unlikely
+
+    alone = fitted()
+    assert named.start_fit_pool(2) == 2
+    try:
+        shared = fitted()
+    finally:
+        named.stop_fit_pool()
+    (T1, e1, n1), *rest1 = alone
+    (T2, e2, n2), *rest2 = shared
+    assert np.array_equal(T1, T2) and np.array_equal(e1, e2) and n1 == n2
+    assert np.array_equal(rest1[0], rest2[0]) and np.array_equal(rest1[1], rest2[1])
+    for a, b in zip(rest1[2:], rest2[2:]):
+        assert len(a) == len(b) and all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+def test_locate_fits_each_set_of_inputs_once(monkeypatch):
+    """A later locate round's proposal, seen as before, is not fitted again:
+    the fit is reused, a copy each time; any input changed, it is fitted.
+    The fits of one batch are made side by side, their results in order."""
+    calls = []
+
+    def quick_fit(model, view, K, screen=False, through=None, image=None):
+        calls.append(screen)
+        if view[4] == "fails":
+            raise ValueError("no fit")
+        return (True, float(view[1].sum())), (np.eye(3), np.zeros(3), np.ones(3))
+    monkeypatch.setattr(ps, "_quick_fit", quick_fit)
+    kept = types.SimpleNamespace(done={}, reused=0)
+    model, K = object(), np.eye(3)
+    mask = np.zeros((6, 6), bool)
+    mask[1:4, 2:5] = True
+    view = (np.zeros((6, 6, 3)), mask, mask.copy(), None, "raw mask")
+    same = tuple(np.copy(v) if isinstance(v, np.ndarray) else v for v in view)
+    first, again = ps._kept_quick_fits(kept, model, K, [(view, None), (same, None)])
+    assert calls == [False] and kept.reused == 1
+    assert first is not again and first[1][0] is not again[1][0]
+    assert first[0] == again[0] and all(np.array_equal(a, b) for a, b in zip(first[1], again[1]))
+    moved = mask.copy()
+    moved[0, 0] = True
+    found = ps._kept_quick_fits(kept, model, K, [
+        (view, None),                                   # made before: reused
+        (view[:1] + (moved,) + view[2:], None),         # another mask
+        (view, mask),                                   # joined through
+        (view[:4] + ("fails",), None),                  # raises: None
+    ])
+    assert len(calls) == 4 and kept.reused == 2
+    assert [f[0][1] if f else None for f in found] == [9.0, 10.0, 9.0, None]
+    ps._kept_quick_fits(kept, model, K, [(view, None)], screen=True)
+    ps._kept_quick_fits(kept, object(), K, [(view, None)])
+    assert calls[-2:] == [True, False] and kept.reused == 2
+    ps._kept_quick_fits(None, model, K, [(view, None)])
+    assert len(calls) == 7

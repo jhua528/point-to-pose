@@ -1,0 +1,60 @@
+{
+ "cmd": "init",
+ "K": [
+  348.0045527399691,
+  0.0,
+  320.5,
+  0.0,
+  348.0045527399691,
+  240.5,
+  0.0,
+  0.0,
+  1.0
+ ],
+ "depth_factor": 1.0,
+ "timestamp": 372.662,
+ "points": [
+  [],
+  [],
+  [],
+  []
+ ],
+ "labels": [
+  [],
+  [],
+  [],
+  []
+ ],
+ "models": [
+  {
+   "vertices": 9160,
+   "faces": 14236
+  },
+  {
+   "vertices": 2263,
+   "faces": 3314
+  },
+  {
+   "vertices": 4240,
+   "faces": 6102
+  },
+  {
+   "vertices": 23536,
+   "faces": 44366
+  }
+ ],
+ "discover": 4,
+ "same_scale_meshes": false,
+ "robot_mask": {
+  "shape": [
+   480,
+   640
+  ],
+  "bits": "eJzt2kFuo0AQRmEQC5YcgaP0lWY5u+ZoPgoXGGmWI40TT+LMJu5qK676jRvnvSUWn3CAAoK7zmg8nVvKT+b35au1zrXevL9v6x028ozl23rDvr3F4b0ovf7DW3fq3crJvU7vHRv3Xuve6+1evov3W+llpZeuecdn9Fap173vEq2Xqt4fr2esiPfV5ur+MBZ/zVuV3qj3Dkpv0Hur7RmLH+D1u/TSM3vGgZY8t88f4T23l60LRfI8LlzxMt7jPOPGLOClPXqux999eLN1vPgeL+/iTRt4fcAbjf0R88oH07a274fY+1ksG0JeuX9jXvn3e2ZvOqq98ngZI9/3pTw/Il7/S+ypt8/wpohnzJeQdyy9HPC6cvvO40XoDTGvWHP8Zt7UlJeb9xap1/Vir1N7l509x7/ba814eI/2fK8r8PCa89I9POH5tgtPeL3Ew9u1N3x+xxD2sta7fMeVg/NA7Q0X3ukeXmDe///d4+fUnu/nB3XP9/p8u+0LeIN4f2zixY5no9a9pRmvN72DePvU3ur2zPMtMBDU3mR6/oGg9mbT8w8EtZdMzz9gbM8/EPI23uL1bE7uHZycPa703ur07HHlHgj22ev35prnHAhqL9U850DINc85EPDwbinVPOfxjBfz5prXyPz7bp76+obXlmc/HZ3c91d4Ma92e+q9f27dIyIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIqKd9A/Z2rHL"
+ },
+ "depth_enc": "raw_f32",
+ "depth_shape": [
+  480,
+  640
+ ]
+}
