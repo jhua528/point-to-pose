@@ -39,6 +39,9 @@ reply says how far that is ("model_binding").
 
 import argparse
 import base64
+import atexit
+import tempfile
+import shutil
 import collections
 import copy
 import functools
@@ -976,6 +979,19 @@ MODEL_KNOWN_SHAPE_MIN_GAIN = 0.0
 MODEL_LOCATED_FALLBACK = True
 # Retry failed localization on fresh frames, with one background fit at a time.
 MODEL_RETRY_INTERVAL_SEC = 3.0
+# The init's fit of a part takes up its refined starts one after another,
+# each measured and stretched in full, until one is a fit; where none is, it
+# went through them all: RI-S4-1's bar, a box in its mask, 26.8 s to be refused;
+# the init waited 31 s for it (2026-11-20). So at the init no further start is
+# taken up past MODEL_INIT_FIT_BUDGET_SEC from the fit's start: the best so far
+# goes out -- coarse, or refused, and so retried on later frames
+# (MODEL_RETRY_INTERVAL_SEC), where the search runs in full; or fine, but then
+# not certain (model_uncertain_why "search cut short") and retried as well
+# (fit_rank()): the starts not tried may hold a better pose, however fast or
+# slow the machine and however many parts. A latency the
+# Agent waits on, the same for any part; the fits of a scene's parts run side
+# by side (FIT_SIDE_BY_SIDE), most within 3-8 s.
+MODEL_INIT_FIT_BUDGET_SEC = 10.0
 # A coarse fit, or one whose size the view hid too much to measure, is fitted
 # again on later views this often, and replaced only by a better one -- fine
 # over coarse, measured over not. A fine, measured fit is kept: the part's
@@ -1558,8 +1574,10 @@ def encode_points(points):
 
 
 def fit_rank(model):
-    """How settled a fitted model is: (fine, size measured)."""
-    return (getattr(model, "fitted_quality", None) == "fit", bool(getattr(model, "fitted_measured", False)))
+    """How settled a fitted model is: (fine, size measured, its search run
+    in full -- not cut short at the init, MODEL_INIT_FIT_BUDGET_SEC)."""
+    return (getattr(model, "fitted_quality", None) == "fit", bool(getattr(model, "fitted_measured", False)),
+            not getattr(model, "fitted_search_cut", False))
 # Acceptance: share of observed points on the mesh, of open mesh points the
 # camera disagrees with, and of mesh points under the support surface. On
 # rendered scenes with 2 mm depth noise, up to 65% hidden, the right mesh
@@ -1775,6 +1793,7 @@ class ObjectModel:
         self.fitted_linear = None
         self.fitted_quality = None
         self.fitted_measured = False
+        self.fitted_search_cut = False        # its init search cut short (MODEL_INIT_FIT_BUDGET_SEC)
         # The fit turned half round about its length, relative to it, where
         # the view fits that about as well (MODEL_TURN_COST_SLACK); and an id
         # of the fit, new with every fit, for what is said of it to hold to.
@@ -2654,6 +2673,7 @@ class _ModelFit:
                 if free_axes:
                     moves += [(("stretch", k), sign, False) for k in range(3) if seen[k]
                               for sign in (1.0, -1.0)]
+                tries = []
                 for axis, sign, turn in moves:
                     sm = scale
                     if axis is None or isinstance(axis, tuple):
@@ -2671,12 +2691,17 @@ class _ModelFit:
                         Rm, tm = E @ R, E @ (t - centre) + centre
                     else:
                         Rm, tm = R, t + sign * step_m * axes[:, axis]
-                    moved = self.terms(sm, Rm, tm, MODEL_SAMPLES, MODEL_FINE_POINTS)
-                    gain = (best or terms)["cost"] - (moved["cost"] if moved else np.inf)
-                    if gain > (0.0 if best else MODEL_POLISH_MIN_GAIN):
-                        best, best_pose = moved, (Rm, tm, sm)
-                if best is None:
+                    tries.append((sm, Rm, tm))
+                # Each move's cost, FIT_WORKERS at a time; the best chosen in
+                # the moves' order, by the same gains as one after another.
+                best_cost, best_pose = None, None
+                for (sm, Rm, tm), cost in zip(tries, fit_jobs(self, "cost", tries, 2)):
+                    gain = (terms["cost"] if best_pose is None else best_cost) - (np.inf if cost is None else cost)
+                    if gain > (0.0 if best_pose is not None else MODEL_POLISH_MIN_GAIN):
+                        best_cost, best_pose = cost, (Rm, tm, sm)
+                if best_pose is None:
                     break
+                best = self.terms(best_pose[2], best_pose[0], best_pose[1], MODEL_SAMPLES, MODEL_FINE_POINTS)
                 terms, (R, t, scale) = best, best_pose
                 axes = R @ self.model.box[:3, :3]
                 centre = R @ (self.linear(scale) @ self.model.box[:3, 3]) + t
@@ -2745,6 +2770,8 @@ class _ModelFit:
         return out
 
     def run(self):
+        started = time.time()
+        budget = getattr(self, "budget", None)
         mesh_n, obs_n, rounds = MODEL_COARSE
         starts, jobs = [], []
         for which, s in enumerate(self.start_scales()):
@@ -2773,6 +2800,16 @@ class _ModelFit:
         # A minimum combined cost can still violate one of the acceptance
         # gates. Try the other refined rotations before declaring no pose.
         for terms, R, t, s in sorted(refined, key=lambda item: item[0]["cost"]):
+            if budget is not None and results and time.time() - started > budget:
+                # The rest is the retries' (MODEL_INIT_FIT_BUDGET_SEC): what
+                # goes out is the best of those tried, not of all, so not
+                # certain, and the retries' full search replaces it (fit_rank()).
+                self.search_cut = True
+                for r in results:
+                    r[0]["scale_note"] = (r[0].get("scale_note", "")
+                                          + f"; the init's search stopped at {time.time() - started:.1f} s, "
+                                            f"its other starts left to the retries")
+                break
             # Starts that refined to the same pose need measuring once.
             if any(np.allclose(np.broadcast_to(s, (3,)), np.broadcast_to(s2, (3,)), rtol=0.02)
                    and np.linalg.norm(t - t2) < self.tol
@@ -3191,6 +3228,84 @@ _FIT_POINT_TERMS = ("pairs", "P", "below")
 _fit_pool = None
 _fit_pool_workers = 0
 _fit_pool_lock = threading.Lock()
+# A fit's large arrays -- the view's camera points, its masks, its observed
+# points and their tree, the mesh's samples and faces -- go to the workers
+# once per fit, not with every call: written once to a file in shared memory
+# (FIT_SHIP_DIR), named by a token the fit keeps, and kept by each worker that
+# reads it (its last FIT_SHIP_KEPT). A call sends the rest, small, each time,
+# so a worker rebuilds the fit as it is then; an array replaced is a new
+# token. Every call shipped all of it before, 8.6 MB a time (2026-11-20).
+FIT_SHIP_MIN_BYTES = 64 * 1024
+FIT_SHIP_KEPT = 8
+FIT_SHIP_DIR = None
+_fit_ship_tokens = collections.deque()
+_worker_shipped = collections.OrderedDict()
+
+
+def _heavy(value):
+    return ((isinstance(value, np.ndarray) and value.nbytes >= FIT_SHIP_MIN_BYTES)
+            or isinstance(value, cKDTree))
+
+
+def _ship_parts(fit):
+    """(light fit, heavy fields {("fit"|"model", name): value}) of `fit` as it is."""
+    heavy = {}
+    light = object.__new__(_ModelFit)
+    for k, v in fit.__dict__.items():
+        if k in _FIT_UNSHIPPED or k.startswith("_ship"):
+            continue
+        if k == "model":
+            model = object.__new__(type(v))
+            for mk, mv in v.__dict__.items():
+                if _heavy(mv):
+                    heavy[("model", mk)] = mv
+                else:
+                    model.__dict__[mk] = mv
+            light.__dict__["model"] = model
+        elif _heavy(v):
+            heavy[("fit", k)] = v
+        else:
+            light.__dict__[k] = v
+    return light, heavy
+
+
+def _ship_token(fit, heavy):
+    """The token of `fit`'s heavy fields in FIT_SHIP_DIR, written there now
+    where they are new or replaced (by identity) since the last call."""
+    signature = tuple(sorted((key, id(value)) for key, value in heavy.items()))
+    token = fit.__dict__.get("_ship_token")
+    if token is not None and fit.__dict__.get("_ship_signature") == signature:
+        return token
+    token = uuid.uuid4().hex
+    with open(os.path.join(FIT_SHIP_DIR, token + ".partial"), "wb") as fh:
+        pickle.dump(heavy, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(os.path.join(FIT_SHIP_DIR, token + ".partial"), os.path.join(FIT_SHIP_DIR, token))
+    # Kept alive with the token, so no other array takes their ids.
+    fit.__dict__.update(_ship_token=token, _ship_signature=signature, _ship_keep=list(heavy.values()))
+    _fit_ship_tokens.append(token)
+    while len(_fit_ship_tokens) > 4 * FIT_SHIP_KEPT:
+        try:
+            os.remove(os.path.join(FIT_SHIP_DIR, _fit_ship_tokens.popleft()))
+        except OSError:
+            pass
+    return token
+
+
+def _fit_worker_run_shipped(ship_dir, token, blob, kind, jobs):
+    heavy = _worker_shipped.get(token)
+    if heavy is None:
+        with open(os.path.join(ship_dir, token), "rb") as fh:
+            heavy = pickle.load(fh)
+        _worker_shipped[token] = heavy
+        while len(_worker_shipped) > FIT_SHIP_KEPT:
+            _worker_shipped.popitem(last=False)
+    else:
+        _worker_shipped.move_to_end(token)
+    fit = pickle.loads(blob)
+    for (owner, name), value in heavy.items():
+        (fit.model if owner == "model" else fit).__dict__[name] = value
+    fit.depth = fit.cam[..., 2]
+    return [_FIT_JOBS[kind](fit, *job) for job in jobs]
 
 
 def _coarse_start(fit, s, R, mesh_n, obs_n, rounds):
@@ -3215,8 +3330,14 @@ def _turn_start(fit, scale, R, t, most, half):
     return fit.polish(scale, R, t, terms)
 
 
+def _cost_job(fit, scale, R, t):
+    """One polish move's cost (polish()), None where no mesh point is in view."""
+    terms = fit.terms(scale, R, t, MODEL_SAMPLES, MODEL_FINE_POINTS)
+    return None if terms is None else terms["cost"]
+
+
 _FIT_JOBS = {"coarse": _coarse_start, "icp": _icp_start, "turn": _turn_start,
-             "proportions": lambda fit, *job: fit.proportions_try(*job)}
+             "proportions": lambda fit, *job: fit.proportions_try(*job), "cost": _cost_job}
 
 
 def _fit_worker_init(server_pid):
@@ -3247,16 +3368,41 @@ def _fit_worker_run(blob, kind, jobs):
     return [_FIT_JOBS[kind](fit, *job) for job in jobs]
 
 
+def _remove_dead_ship_dirs(base):
+    """Remove the fit ship directories in `base` left by servers no longer
+    running (killed, so their atexit never ran): those whose pid is gone."""
+    for name in os.listdir(base):
+        if not name.startswith("pose_server_fits_"):
+            continue
+        try:
+            pid = int(name[len("pose_server_fits_"):].split("_", 1)[0])
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, 0)
+            continue                      # still running (or not ours to judge)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            continue
+        shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+
+
 def start_fit_pool(workers):
     """Start `workers` fit worker processes (FIT_WORKERS), all now; the
     number started, 0 where none could be and the fits stay here. Spawned,
     not forked: a fork of a process holding CUDA cannot use it, nor be sure
     of anything else the server's threads hold."""
-    global _fit_pool, _fit_pool_workers, FIT_WORKERS
+    global _fit_pool, _fit_pool_workers, FIT_WORKERS, FIT_SHIP_DIR
     workers = int(workers)
     if workers <= 1 or _fit_pool is not None:
         return _fit_pool_workers
     started = time.time()
+    if FIT_SHIP_DIR is None:
+        base = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+        _remove_dead_ship_dirs(base)
+        FIT_SHIP_DIR = tempfile.mkdtemp(prefix=f"pose_server_fits_{os.getpid()}_", dir=base)
+        atexit.register(shutil.rmtree, FIT_SHIP_DIR, True)
     # Each worker takes the environment it starts in: no GPU, one BLAS thread
     # (a worker's share of the starts is its whole core), and the flag that
     # leaves torch and the pipeline out of its import (IN_FIT_WORKER).
@@ -3315,13 +3461,15 @@ def fit_jobs(fit, kind, jobs, min_jobs=FIT_PARALLEL_MIN):
     pool, workers = _fit_pool, _fit_pool_workers
     if pool is None or len(jobs) < max(2, min_jobs):
         return [run(fit, *job) for job in jobs]
-    copy_ = object.__new__(_ModelFit)
-    copy_.__dict__.update({k: v for k, v in fit.__dict__.items() if k not in _FIT_UNSHIPPED})
-    blob = pickle.dumps(copy_, protocol=pickle.HIGHEST_PROTOCOL)
+    # The fit's large arrays once (FIT_SHIP_MIN_BYTES), the rest with each call.
+    light, heavy = _ship_parts(fit)
+    token = _ship_token(fit, heavy)
+    blob = pickle.dumps(light, protocol=pickle.HIGHEST_PROTOCOL)
     # Consecutive shares, about equal: a start's cost is set by its rounds and points.
     bounds = np.linspace(0, len(jobs), min(workers, len(jobs)) + 1).round().astype(int)
     try:
-        futures = [pool.submit(_fit_worker_run, blob, kind, jobs[a:b]) for a, b in zip(bounds[:-1], bounds[1:])]
+        futures = [pool.submit(_fit_worker_run_shipped, FIT_SHIP_DIR, token, blob, kind, jobs[a:b])
+                   for a, b in zip(bounds[:-1], bounds[1:])]
         return [result for future in futures for result in future.result()]
     except BrokenProcessPool as exc:
         with _fit_pool_lock:
@@ -3377,7 +3525,7 @@ def model_pose_rejection(terms, coarse=False):
 
 
 def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, located=None, image=None,
-                  known_shape=None):
+                  known_shape=None, budget=None):
     """Box of one object from its mesh: ((T_cam_box, extent, note), None) if
     the mesh fits the view, (None, reason) if not.
 
@@ -3391,12 +3539,14 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, locat
     """
     model.fitted_pose = model.fitted_scale = model.fitted_linear = None
     model.fitted_quality, model.fitted_measured = None, False
+    model.fitted_search_cut = False
     model.fitted_tol = None
     model.fitted_spin_doubt = model.fitted_ends_doubt = model.fitted_id = None
     model.fitted_doubts, model.fitted_unlikely = [], []
     model.fitted_known_shape = None
     fit = _ModelFit(model, view, K, rng or np.random.default_rng(0), through, scale_hint, located, image,
                     known_shape)
+    fit.budget = budget                    # MODEL_INIT_FIT_BUDGET_SEC, at the init only
     result = fit.run()
     if result is None:
         return None, "no pose left any mesh point in view"
@@ -3465,6 +3615,7 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, locat
     model.fitted_scale = _overall(scale)
     model.fitted_linear = M
     model.fitted_quality, model.fitted_measured = quality, bool(terms["measured"])
+    model.fitted_search_cut = bool(getattr(fit, "search_cut", False))
     model.fitted_tol = fit.tol
     model.fitted_stretch_wanted = bool(getattr(fit, "stretch_wanted", False)) and quality == "fit"
     # How far the mesh lies off its part, as this fit shows (see FIT_TOL_SIZE).
@@ -3687,21 +3838,38 @@ def _outline(S):
     return S & ~(cv2.erode(S8, np.ones((3, 3), np.uint8)) > 0)
 
 
+# How far past the silhouettes ends_evidence() looks: its outlines (a 3x3
+# erosion) and the band about them (a 9x9 dilation), each a pixel more.
+ENDS_EVIDENCE_REACH_PX = 9 // 2 + 3
+
+
 def ends_evidence(fit, Zj, Zk):
     """Two ways round's silhouettes against this frame's mask (see
     ENDS_SILHOUETTE_SIGMAS): `Zj`, `Zk` their mesh_depth()s. {"for_j",
     "for_k": the pixels for each, "told": both, "area": the silhouettes'
     union, "noise": the margin the view's own mismatch allows, "winner":
-    "j", "k" or None, "why": where None}."""
+    "j", "k" or None, "why": where None}. Counted on the silhouettes' box
+    and ENDS_EVIDENCE_REACH_PX about it: nothing farther out counts."""
     Sj, Sk = np.isfinite(Zj), np.isfinite(Zk)
+    rows, cols = np.flatnonzero((Sj | Sk).any(1)), np.flatnonzero((Sj | Sk).any(0))
+    d, mask = fit.depth, fit.mask
+    if len(rows):
+        r = ENDS_EVIDENCE_REACH_PX
+        box = (slice(max(0, rows[0] - r), rows[-1] + r + 1), slice(max(0, cols[0] - r), cols[-1] + r + 1))
+        Zj, Zk, Sj, Sk, d, mask = Zj[box], Zk[box], Sj[box], Sk[box], d[box], mask[box]
+    return _ends_evidence(Sj, Sk, Zj, Zk, d, mask, fit.tol)
+
+
+def _ends_evidence(Sj, Sk, Zj, Zk, d, mask, tol):
+    """ends_evidence() on arrays: the silhouettes, their depths, this frame's
+    depth and mask, and the TOL."""
     area = int((Sj | Sk).sum())
-    d = fit.depth
     has = np.isfinite(d) & (d > 0)
 
     def judge(only, Z):
         # Pixels only this way round covers: (for it, against it).
-        usable = only & has & ~(d < Z - fit.tol)           # nothing nearer hides it
-        on = usable & fit.mask & (d <= Z + fit.tol)
+        usable = only & has & ~(d < Z - tol)               # nothing nearer hides it
+        on = usable & mask & (d <= Z + tol)
         return int(on.sum()), int((usable & ~on).sum())
 
     on_j, off_j = judge(Sj & ~Sk, Zj)
@@ -3714,8 +3882,8 @@ def ends_evidence(fit, Zj, Zk):
     both = Sj == Sk
     line_j = _outline(Sj) & both
     near = cv2.dilate(line_j.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
-    seen_part = fit.mask & has & (np.abs(d - np.where(Sj, Zj, d)) <= fit.tol)
-    hidden = Sj & has & (d < Zj - fit.tol)
+    seen_part = mask & has & (np.abs(d - np.where(Sj, Zj, d)) <= tol)
+    hidden = Sj & has & (d < Zj - tol)
     wrong = near & both & has & ~hidden & (Sj != seen_part)
     rate = float(wrong.sum()) / max(1, int(line_j.sum()))
     # Along the outline of where the two differ, as many could fall either way.
@@ -4001,7 +4169,7 @@ class Binding:
         self.frames += 1
         return True
 
-    def feature_groups(self, P_j, P_k):
+    def feature_groups(self, P_j, P_k, tree_k=None):
         """Way round j's features against k, each posed on this frame (P_j,
         P_k): its samples farther than the tolerance from k's, where it has
         what k has not, joined where within MODEL_FRAGMENT_GAP spacings of each
@@ -4010,7 +4178,8 @@ class Binding:
         as turned relative to each other, the corrected one lies on the part
         -- on the tester turning, those samples of the wrong way round came
         out seen on in 13 votes of 36."""
-        apart = cKDTree(P_k).query(P_j, distance_upper_bound=self.tol)[0] > self.tol
+        tree_k = cKDTree(P_k) if tree_k is None else tree_k
+        apart = tree_k.query(P_j, distance_upper_bound=self.tol)[0] > self.tol
         idx = np.flatnonzero(apart)
         out = []
         if len(idx) >= MIN_BOX_POINTS:
@@ -4028,7 +4197,9 @@ class Binding:
         vote."""
         voted = set()
         unit = min(1.0, (self.spacing / self.tol) ** 2)
-        groups = {(j, k): self.feature_groups(placed[j], placed[k]) for j in placed for k in placed if j != k}
+        trees = {k: cKDTree(P) for k, P in placed.items()}      # each way round's, once
+        groups = {(j, k): self.feature_groups(placed[j], placed[k], trees[k])
+                  for j in placed for k in placed if j != k}
         for j, (on_j, through_j) in verdicts.items():
             for k, (on_k, through_k) in verdicts.items():
                 if j == k:
@@ -5387,7 +5558,7 @@ class PoseServer:
         calls = [functools.partial(
             fit_model_box, models[index], views[index], K, through=cut[index],
             scale_hint=self.scale_hints[index], located=getattr(self, "locate_shapes", {}).get(index),
-            image=rgb, known_shape=self.shape_hints[index]) for index in fitting]
+            image=rgb, known_shape=self.shape_hints[index], budget=MODEL_INIT_FIT_BUDGET_SEC) for index in fitting]
         if meanwhile is None or not calls:
             fits = dict(zip(fitting, side_by_side(calls)))
         else:
@@ -5551,7 +5722,7 @@ class PoseServer:
 
         eligible = [i for i, model in enumerate(self.models)
                     if self.model_required[i] and model is not None
-                    and (self.fitted_models[i] is None or fit_rank(self.fitted_models[i]) < (True, True))
+                    and (self.fitted_models[i] is None or fit_rank(self.fitted_models[i]) < (True, True, True))
                     and not tracking_lost[i] and now >= self.model_retry_after[i]]
         if not eligible:
             return
@@ -6461,6 +6632,8 @@ class PoseServer:
                         why.append("ways round in doubt")
                     if (result.get("model_axial") or {}).get("length_range_m") is not None:
                         why.append("length not seen end to end")
+                    if getattr(model, "fitted_search_cut", False):
+                        why.append("search cut short")
                     result["model_certain"] = not why
                     result["model_uncertain_why"] = why
                     # How far its binding is, and how to tell its ways round (BINDING_CONFIDENCE).
