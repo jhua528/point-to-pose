@@ -51,6 +51,14 @@ pipeline:
     max_rel_rotation_deg: 30
     pose_jump_guard_trans_thres: 0.15
     pose_jump_guard_rot_deg_thres: 30
+    # The same as speeds, over the time since the frame before: a part carried
+    # by the robot or a hand moves up to about 1 m/s and half a turn a second.
+    # The server tracks about a frame a second, where 0.15 m a frame alone let
+    # a part move at no more than 0.15 m/s. The per-frame limits above stay the
+    # least allowed; the client can send its own (init meta max_speed_mps,
+    # max_turn_dps).
+    pose_jump_guard_max_speed: 1.0
+    pose_jump_guard_max_rot_speed_deg: 180
     pose_jump_guard_min_inliers: 5
     pose_jump_guard_single_cluster_min_inliers: 5
     pose_jump_guard_enable: true

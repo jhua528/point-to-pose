@@ -1,0 +1,61 @@
+{
+ "vlm_clicked": [
+  "ring",
+  "bar"
+ ],
+ "model": "qwen3.8-flash",
+ "seconds": 3.31,
+ "parts": {
+  "ring": {
+   "points": [
+    [
+     117,
+     93
+    ],
+    [
+     112,
+     108
+    ]
+   ],
+   "on_part": [
+    true,
+    false
+   ],
+   "dropped": [
+    [
+     [
+      128,
+      105
+     ],
+     "on another part's point"
+    ]
+   ]
+  },
+  "bar": {
+   "points": [
+    [
+     102,
+     125
+    ],
+    [
+     152,
+     87
+    ]
+   ],
+   "on_part": [
+    true,
+    true
+   ],
+   "dropped": [
+    [
+     [
+      128,
+      105
+     ],
+     "on another part's point"
+    ]
+   ]
+  }
+ },
+ "reply": "ring: 201,219; 183,194; 175,226\nbar: 160,260; 201,219; 238,181"
+}

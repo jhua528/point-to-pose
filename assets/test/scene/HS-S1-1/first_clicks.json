@@ -1,0 +1,101 @@
+{
+ "vlm_clicked": [
+  "ring",
+  "bar",
+  "tester",
+  "sample"
+ ],
+ "model": "qwen3.8-flash",
+ "seconds": 4.37,
+ "parts": {
+  "ring": {
+   "points": [
+    [
+     134,
+     97
+    ],
+    [
+     137,
+     84
+    ],
+    [
+     138,
+     110
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "bar": {
+   "points": [
+    [
+     185,
+     97
+    ],
+    [
+     205,
+     97
+    ],
+    [
+     226,
+     97
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "tester": {
+   "points": [
+    [
+     202,
+     240
+    ],
+    [
+     224,
+     240
+    ],
+    [
+     245,
+     240
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "sample": {
+   "points": [
+    [
+     385,
+     251
+    ],
+    [
+     419,
+     251
+    ],
+    [
+     454,
+     251
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  }
+ },
+ "reply": "OBJECT ring: 210,203; 214,175; 216,230\nOBJECT bar: 289,203; 321,203; 353,203\nOBJECT tester: 316,500; 350,500; 384,500\nOBJECT sample: 602,525; 656,525; 710,525"
+}

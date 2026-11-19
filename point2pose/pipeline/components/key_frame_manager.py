@@ -371,7 +371,7 @@ class KeyFrameManager:
                     continue
 
             frame_growth_ok, frame_growth_reason = self._frame_allows_map_growth(
-                obj_id=obj_id, frame_id=int(cur_frame.id), fe_result=cur_fe_result
+                obj_id=obj_id, frame_id=int(cur_frame.id), fe_result=cur_fe_result, obj=obj
             )
 
             if conservative:
@@ -1024,7 +1024,7 @@ class KeyFrameManager:
         self.pending_keyframes[obj_id] = keep
 
     def _frame_allows_map_growth(
-        self, obj_id: int, frame_id: int, fe_result
+        self, obj_id: int, frame_id: int, fe_result, obj=None
     ) -> Tuple[bool, str]:
         """
         Frame-level gate for map growth (sampling + pending promotion).
@@ -1064,7 +1064,8 @@ class KeyFrameManager:
             except Exception:
                 mean_res = None
         if mean_res is not None and np.isfinite(mean_res):
-            if mean_res > self.map_growth_max_mean_residual:
+            # The object's own gate where its tracker set one (pose_server's frontend_gates()).
+            if mean_res > getattr(obj, "map_growth_max_mean_residual", self.map_growth_max_mean_residual):
                 return False, f"mean_residual_{mean_res:.4e}"
 
         return True, "ok"
@@ -1142,7 +1143,7 @@ class KeyFrameManager:
         score = float(np.percentile(vals, q))
         return bool(np.isfinite(score) and score <= self.pending_sdf_gate_thres)
 
-    def _pending_obs_geom_ok(self, meta: dict) -> Tuple[bool, dict]:
+    def _pending_obs_geom_ok(self, meta: dict, obj=None) -> Tuple[bool, dict]:
         obs = np.asarray(meta.get("obs_obj", []), dtype=np.float32).reshape(-1, 3)
         if obs.shape[0] < self.pending_obs_min_count:
             return False, {"n_obs": int(obs.shape[0]), "spread": np.inf}
@@ -1150,7 +1151,7 @@ class KeyFrameManager:
         med = np.median(obs, axis=0)
         d = np.linalg.norm(obs - med[None, :], axis=1)
         spread = float(np.median(d)) if d.size else np.inf
-        if (not np.isfinite(spread)) or (spread > self.pending_obj_spread_thres):
+        if (not np.isfinite(spread)) or (spread > getattr(obj, "pending_obj_spread_thres", self.pending_obj_spread_thres)):
             return False, {"n_obs": int(obs.shape[0]), "spread": spread}
 
         if self.pending_use_view_diversity:
@@ -1284,7 +1285,7 @@ class KeyFrameManager:
         if int(meta.get("good", 0)) < int(self.pending_promote_streak):
             return False
         if self.pending_use_geom_check:
-            geom_ok, _ = self._pending_obs_geom_ok(meta)
+            geom_ok, _ = self._pending_obs_geom_ok(meta, obj)
             if not geom_ok:
                 return False
 

@@ -1,0 +1,55 @@
+{
+ "vlm_clicked": [
+  "ring",
+  "bar"
+ ],
+ "model": "qwen3.8-flash",
+ "seconds": 3.15,
+ "parts": {
+  "ring": {
+   "points": [
+    [
+     289,
+     222
+    ],
+    [
+     294,
+     224
+    ],
+    [
+     299,
+     221
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "bar": {
+   "points": [
+    [
+     178,
+     97
+    ],
+    [
+     205,
+     97
+    ],
+    [
+     232,
+     97
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  }
+ },
+ "reply": "OBJECT ring: 452,463; 460,468; 468,461\nOBJECT bar: 279,203; 321,203; 363,203"
+}

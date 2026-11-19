@@ -82,6 +82,16 @@ class FrontEnd:
                 "pose_jump_guard_rot_deg_thres", self.max_rel_rotation_deg
             )
         )
+        # The guard's limits as speeds where they are given (m/s, deg/s): a jump
+        # is then what moves further than that in the time since the frame
+        # before -- at a frame a second, 0.15 m a frame let a part move at no
+        # more than 0.15 m/s. The per-frame limits above stay the least allowed.
+        speed = self.pipeline_cfg.get("pose_jump_guard_max_speed", None)
+        turn = self.pipeline_cfg.get("pose_jump_guard_max_rot_speed_deg", None)
+        self.pose_jump_guard_max_speed = None if speed is None else float(speed)
+        self.pose_jump_guard_max_rot_speed_deg = None if turn is None else float(turn)
+        self._last_frame_ts = None
+        self._frame_interval = None
         reg_min_inliers = int(self.cfg.register.params.get("min_inliers", 5))
         self.pose_jump_guard_min_inliers = int(
             self.pipeline_cfg.get(
@@ -229,6 +239,13 @@ class FrontEnd:
         Returns:
             FrontEndResult
         """
+        # The time since the frame before (s), for the jump guard's speeds.
+        ts = getattr(frame, "timestamp", None)
+        self._frame_interval = None
+        if ts is not None and self._last_frame_ts is not None and float(ts) > self._last_frame_ts:
+            self._frame_interval = float(ts) - self._last_frame_ts
+        if ts is not None:
+            self._last_frame_ts = float(ts)
         # Timing dictionary for frontend modules
         fe_timings = {}
 
@@ -429,7 +446,8 @@ class FrontEnd:
                     stats_reg["pose_jump_guard_info"] = jump_info
                     if jump_rejected:
                         obj.lost = True
-                    elif 0 < mean_res < self.reg_residual_thres:
+                    elif 0 < mean_res < getattr(obj, "reg_residual_thres", self.reg_residual_thres):
+                        # The object's own gate where its tracker set one (pose_server's frontend_gates()).
                         obj.lost = False
                 else:
                     print(
@@ -451,7 +469,7 @@ class FrontEnd:
             T_prev = obj.pose.copy()
             if self.frame_reg_mode == "f2f":
                 # Frame-to-frame: compose relative pose
-                if T_rel is not None and 0 < mean_res < self.reg_residual_thres:
+                if T_rel is not None and 0 < mean_res < getattr(obj, "reg_residual_thres", self.reg_residual_thres):
                     T_odom = T_rel @ T_prev
                 else:
                     T_odom = T_prev
@@ -787,9 +805,14 @@ class FrontEnd:
         )
         info["relaxed_when_lost"] = bool(relax_when_lost)
 
-        big_jump = (dt > self.pose_jump_guard_trans_thres) or (
-            ddeg > self.pose_jump_guard_rot_deg_thres
-        )
+        trans_thres, rot_thres = self.pose_jump_guard_trans_thres, self.pose_jump_guard_rot_deg_thres
+        if self._frame_interval:
+            if self.pose_jump_guard_max_speed is not None:
+                trans_thres = max(trans_thres, self.pose_jump_guard_max_speed * self._frame_interval)
+            if self.pose_jump_guard_max_rot_speed_deg is not None:
+                rot_thres = max(rot_thres, self.pose_jump_guard_max_rot_speed_deg * self._frame_interval)
+        info["trans_thres"], info["rot_thres"] = float(trans_thres), float(rot_thres)
+        big_jump = (dt > trans_thres) or (ddeg > rot_thres)
         if relax_when_lost and big_jump:
             # T_prev is frozen and stale, so a large jump from it may be a correct
             # re-acquisition. Gate it on support alone, at a stricter inlier bar

@@ -352,6 +352,25 @@ def encode_mask(mask):
             "bits": base64.b64encode(zlib.compress(np.packbits(mask).tobytes())).decode("ascii")}
 
 
+def off_robot(points, labels, robot):
+    """(points, labels, dropped): each object's clicks less those on the
+    robot's pixels (`robot`, None: none known) -- a click sent on the arm or
+    the gripper makes the server's segment of the part the robot's. Only the
+    clicks the client is started with are so checked (an upstream VLM's or
+    a person's); `dropped`, per object, how many went."""
+    if robot is None:
+        return points, labels, [0] * len(points)
+    h, w = robot.shape
+    out_points, out_labels, dropped = [], [], []
+    for pts, lbls in zip(points, labels):
+        keep = [k for k, (u, v) in enumerate(pts)
+                if not robot[min(max(int(round(v)), 0), h - 1), min(max(int(round(u)), 0), w - 1)]]
+        out_points.append([pts[k] for k in keep])
+        out_labels.append([lbls[k] for k in keep])
+        dropped.append(len(pts) - len(keep))
+    return out_points, out_labels, dropped
+
+
 def safe_grasps(grasps, linear, turns, tol_m, tol_deg, flip_axis=None):
     """Indices of `grasps` (4x4, the gripper in the mesh's frame and units)
     that every way round in `turns` (4x4 relative to the pose published, in
@@ -474,7 +493,12 @@ class PoseClient(Node):
         # their meshes, and the clicks of those it clicks in the hand, with
         # the hand's pose then: {index: (camera points, hand)}.
         self.last_seen_box, self.hand_near = {}, {}
+        # Each part's mesh pose where last seen, and the camera it was seen
+        # in: where a pose prior moves its last seen box to (set_down_seen()).
+        self.last_seen_model, self.camera_frame = {}, None
         self.relocate_by_mesh, self.relocate_carried = [], {}
+        # The parts an init sent again keeps the fits of (relocate()).
+        self.relocate_keep = []
         # Inits sent again that failed in a row, and when the next may go.
         self.relocate_failures, self.relocate_retry_at = 0, 0.0
         # (time, both fingertips in contact) of the last tactile reading.
@@ -667,6 +691,12 @@ class PoseClient(Node):
             meta["models"].append({"vertices": len(vertices), "faces": len(faces)})
             if self.args.true_size_meshes:
                 meta["models"][-1]["known_scale"] = 1.0
+            if self.args.mesh_error is not None:
+                meta["models"][-1]["mesh_error"] = float(self.args.mesh_error)
+            if self.args.mesh_stretch_max is not None:
+                meta["models"][-1]["stretch_max"] = float(self.args.mesh_stretch_max)
+            if self.args.mesh_unit is not None:
+                meta["models"][-1]["unit_m"] = float(self.args.mesh_unit)
             if colours is not None:
                 meta["models"][-1]["colours"] = True
             frames.append(zlib.compress(vertices.astype("<f4").tobytes()
@@ -773,10 +803,17 @@ class PoseClient(Node):
                                                                        json.loads(self.args.labels))
             if self.relocate_points:
                 meta["points"] = self.carried_clicks(meta["points"], rgb_msg.header.frame_id, rgb.shape[:2])
+                if self.relocate_keep:
+                    meta["keep"] = [self.object_names.index(name) for name in self.relocate_keep]
             robot = self.robot_mask(depth.astype(np.float64) / depth_factor, rgb_msg.header.frame_id)
             if robot is None and self.robot_links and time.time() - self.started < ROBOT_WAIT_S:
                 self.get_logger().info("waiting for the robot's transforms", throttle_duration_sec=5.0)
                 return
+            if not self.relocate_points:
+                meta["points"], meta["labels"], dropped = off_robot(meta["points"], meta["labels"], robot)
+                for name, n in zip(self.object_names, dropped):
+                    if n:
+                        self.get_logger().info(f"{name}: {n} of its clicks on the robot left out")
             extra = self.mesh_frames(meta)
             meta["discover"] = self.args.obstacles
             meta["same_scale_meshes"] = self.args.same_scale_meshes
@@ -821,12 +858,19 @@ class PoseClient(Node):
             return
         if not self.initialized:
             self.initialized = True
-            # Ways round asked of an earlier init are no longer the server's.
+            # Ways round asked of an earlier init are no longer the server's,
+            # but for the parts that kept their fits (pose_sever's carry_kept_fits()).
+            kept = {self.object_names[index] for index in reply.get("kept") or []
+                    if isinstance(index, int) and 0 <= index < len(self.object_names)}
             for name in list(self.binding_asked):
-                self.withdraw_binding(name)
-            self.binding_answers = {}
+                if name not in kept:
+                    self.withdraw_binding(name)
+            self.binding_answers = {index: answer for index, answer in self.binding_answers.items()
+                                    if self.object_names[index] in kept}
+            if kept:
+                self.get_logger().info(f"{', '.join(sorted(kept))}: kept the fit as last seen")
             self.relocate_points = None
-            self.relocate_by_mesh, self.relocate_carried = [], {}
+            self.relocate_by_mesh, self.relocate_carried, self.relocate_keep = [], {}, []
             self.relocate_failures = 0
             self.lost_replies = {name: 0 for name in self.object_names}
             self.get_logger().info("pipeline initialized")
@@ -835,7 +879,7 @@ class PoseClient(Node):
             used = reply.get("points")
             if isinstance(used, list) and len(used) == len(self.object_names):
                 for name, sent, click in zip(self.object_names, meta["points"], used):
-                    if not sent:
+                    if not sent and name not in kept:
                         self.get_logger().info(f"{name}: located by its mesh at {click}")
             for name, error in zip(self.object_names, reply.get("model_errors") or []):
                 if error:
@@ -857,6 +901,7 @@ class PoseClient(Node):
         # last box, and the tester lost in the hand was located again by its
         # mesh -- not found there, the person asked to click it (PP-S1-4,
         # 2026-11-09).
+        self.camera_frame = rgb_msg.header.frame_id
         self.relocate_seen(lost, reply.get("bboxes"),
                            self.link_in(rgb_msg.header.frame_id, HAND_LINK, stamp=rgb_msg.header.stamp))
         # Apply mesh recognition validity before publishing even the raw array:
@@ -1011,6 +1056,7 @@ class PoseClient(Node):
             return
         self.pose_priors[name] = (np.asarray(pose, dtype=float), str(prior.get("source") or "client"))
         self.get_logger().info(f"{name}: pose prior from {self.pose_priors[name][1]}, sent with the next frame")
+        self.set_down_seen(name, self.pose_priors[name][0])
         wait = self.awaiting_clicks
         if wait is not None and name in wait["asked"] and wait["points"][self.object_names.index(name)] is None:
             # A click asked on it while it was in the hand, out of view, waits
@@ -1026,19 +1072,51 @@ class PoseClient(Node):
             self.get_logger().info(f"{', '.join(missing)}: no click waited for now it is set down; "
                                    "located again by its mesh")
 
-    def camera_priors(self, frame):
-        """The pose priors waiting, in the camera `frame`: meta["priors"]."""
-        if not self.pose_priors or not frame:
-            return []
+    def set_down_seen(self, name, pose):
+        """A part lost, set down at `pose` (world, its mesh's): where it was
+        last seen is where it is set down now, its box carried there with its
+        mesh, for relocate() to wait on the robot clear of. PP-S3-2's tester,
+        lost in the hand up in the air and set down on the bench, waited 60 s
+        and more on the arm, gone home, to leave where it was last seen -- in
+        the image, where the arm at home is (batch 20261113_keepfit)."""
+        box, model = self.last_seen_box.get(name), self.last_seen_model.get(name)
+        if not self.lost_replies.get(name, 0) or box is None or model is None:
+            return
+        cam_world = self.camera_from_world(self.camera_frame, "pose prior's last seen box")
+        if cam_world is None:
+            return
+        T = cam_world @ pose @ np.linalg.inv(model) @ box[0]
+        moved = {"pose": T.tolist(), "extent": box[1].tolist()}
+        pixels = self.box_pixels(moved)
+        if pixels is None:
+            return
+        self.last_seen_px[name], self.last_seen_box[name] = pixels, (T, box[1])
+        self.last_seen_model[name] = cam_world @ pose
+        self.hand_near.pop(name, None)
+        self.get_logger().info(f"{name}: last seen where it was set down, for locating it again")
+
+    def camera_from_world(self, frame, what):
+        """The world in the camera `frame`, 4x4, or None."""
+        if not frame:
+            return None
         try:
             tf = self.tf_buffer.lookup_transform(frame, "world", Time())
         except Exception as exc:
-            self.get_logger().warn(f"no TF {frame} <- world for the pose priors: {exc}", throttle_duration_sec=5.0)
-            return []
+            self.get_logger().warn(f"no TF {frame} <- world for the {what}: {exc}", throttle_duration_sec=5.0)
+            return None
         t, q = tf.transform.translation, tf.transform.rotation
         cam_world = np.eye(4)
         cam_world[:3, :3] = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
         cam_world[:3, 3] = [t.x, t.y, t.z]
+        return cam_world
+
+    def camera_priors(self, frame):
+        """The pose priors waiting, in the camera `frame`: meta["priors"]."""
+        if not self.pose_priors or not frame:
+            return []
+        cam_world = self.camera_from_world(frame, "pose priors")
+        if cam_world is None:
+            return []
         return [{"object": self.object_names.index(name), "pose": (cam_world @ pose).tolist(), "source": source}
                 for name, (pose, source) in self.pose_priors.items()]
 
@@ -1167,6 +1245,11 @@ class PoseClient(Node):
                 self.last_seen_px[name] = pixels
                 self.last_seen_box[name] = reply_box(bbox)
                 self.hand_near.pop(name, None)
+                model = rigid(bbox.get("model_pose")) if isinstance(bbox, dict) else None
+                if model is not None:
+                    self.last_seen_model[name] = np.asarray(model, dtype=np.float64)
+                else:
+                    self.last_seen_model.pop(name, None)
             box = self.last_seen_box.get(name)
             if hand is not None and box is not None:
                 self.hand_near[name] = min(self.hand_near.get(name, np.inf), box_distance(hand[:3, 3], *box))
@@ -1297,11 +1380,16 @@ class PoseClient(Node):
         if self.held_back(due, [name for name in by_mesh if self.near_hand(name)]):
             return
         clicked = [name for name in self.models if name not in by_mesh]
+        # The others keep their fits as last seen, where the view does not
+        # say otherwise (pose_sever's carry_kept_fits()): fitted afresh, a
+        # part tracked all along lost its measured size and ways round.
+        keep = [name for name in self.models if name not in due]
         self.get_logger().warn(f"{', '.join(due)}: lost for {max(self.lost_replies[n] for n in due)} replies; "
                                "locating every object again"
-                               + (f", {', '.join(clicked)} clicked where seen" if clicked else ""))
+                               + (f", {', '.join(clicked)} clicked where seen" if clicked else "")
+                               + (f", {', '.join(keep)} to keep their fits" if keep else ""))
         self.relocate_points = (points, labels)
-        self.relocate_by_mesh, self.relocate_carried = by_mesh, carried
+        self.relocate_by_mesh, self.relocate_carried, self.relocate_keep = by_mesh, carried, keep
         self.last_relocate = time.time()
         self.initialized = False
         self._invalidate_all()
@@ -1818,6 +1906,18 @@ def main():
                     help="the meshes of --models are the parts' true sizes (CAD models, or "
                          "reconstructions scaled to measure): each is fitted at that size only, "
                          "which also tells it from parts of the same shape and another size")
+    ap.add_argument("--mesh-error", type=float, default=None,
+                    help="how far the meshes of --models are off their parts' surfaces: the 95th "
+                         "percentile, as a share of a mesh's diagonal (0 for CAD models). Every fit's "
+                         "tolerance allows for it; unset, the server takes a demonstration "
+                         "reconstruction's (MESH_ERROR_P95, 2.25 %%)")
+    ap.add_argument("--mesh-stretch-max", type=float, default=None,
+                    help="how far the proportions of the meshes of --models may be off their parts', as a "
+                         "factor along any box axis (1 for CAD models, whose proportions are exact). Unset, "
+                         "the server allows a demonstration reconstruction's (MODEL_STRETCH_MAX, 1.4)")
+    ap.add_argument("--mesh-unit", type=float, default=None,
+                    help="metres per unit of the meshes of --models: 0.001 for meshes in millimetres. Unset, "
+                         "metres. The poses and scales sent back are the meshes' as given, in their units")
     ap.add_argument("--mesh-colours", action="store_true",
                     help="send each mesh's vertex colours (an OBJ's \"v x y z r g b\" lines), which the "
                          "server then also locates its part by: of two parts alike in size and shape, "
@@ -1840,9 +1940,12 @@ def main():
     ap.add_argument("--props", default="",
                     help="comma-separated names announced beside --objects whose poses another "
                          "node publishes: truth_bridge.py --props ... --no-announce")
-    ap.add_argument("--obstacles", type=int, default=4,
+    ap.add_argument("--obstacles", type=int, default=0,
                     help="how many obstacles at most the server looks for at init, with no click "
-                         f"and no mesh, published as {OBSTACLE_PREFIX}<n>; 0 for none")
+                         f"and no mesh, published as {OBSTACLE_PREFIX}<n>; default 0, none: the Agent "
+                         "keeps what is in the way from the depth itself (its unnamed voxels), which "
+                         "follow a moved box where the server's following lost it and left it where it was "
+                         "(PP-S3-2, RI-S3-2, 2026-11-13)")
     ap.add_argument("--not-robot", default="table",
                     help="comma-separated links of the robot description that are not the "
                          "robot, left out of the robot's pixels: the bench, which every part "

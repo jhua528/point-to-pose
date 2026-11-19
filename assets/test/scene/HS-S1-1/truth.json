@@ -1,0 +1,718 @@
+{
+ "note": "GROUND TRUTH from Gazebo, for offline debugging only: no run, and nothing pose_client sends, knows it. Each object's model_pose/model_linear are in the server's reply terms: the mesh sent (mesh_file, its own vertex frame) is at x_cam = model_pose[:3,:3] @ (model_linear @ x) + model_pose[:3,3], in the camera's optical frame the request's K and depth are in (x right, y down, z forward, metres). alike_model_poses: poses the simulated part looks the same in (as true as model_pose; the sample either side up). model_linear is the calibrated scale of the demonstration mesh to the simulated part (sim_alignment.json), anisotropic; model_scale its cube-root volume scale. depth_check: the mesh so posed rendered into the camera against depth_m.npy, where it is seen (within 10 mm) -- the mesh is the demonstration's reconstruction, not the simulated part's own, so a few mm is its shape error (calibration_chamfer_mm). others: every other Gazebo model's link pose in the camera frame (props, obstacles, the person; not the robot).",
+ "frame": "camera optical frame of the captured images (the request's K, depth_shape)",
+ "T_world_camera": [
+  [
+   1.0,
+   -0.0,
+   -0.0,
+   0.0
+  ],
+  [
+   0.0,
+   -0.5877853,
+   0.809017,
+   -1.3
+  ],
+  [
+   -0.0,
+   -0.809017,
+   -0.5877853,
+   1.3
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "objects": [
+  {
+   "index": 0,
+   "name": "ring",
+   "mesh_file": "mesh_ring.f32i32.zlib",
+   "mesh_source": "agent/knowledge/demos/ring_insertion/model/obj_1/refined_model/model.obj",
+   "model_pose": [
+    [
+     -0.0010631,
+     -0.0028465,
+     0.9999949,
+     -0.2999594
+    ],
+    [
+     -0.4931693,
+     0.8699312,
+     0.0019514,
+     -0.2294303
+    ],
+    [
+     -0.8699326,
+     -0.4931654,
+     -0.0023282,
+     0.5731469
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "model_linear": [
+    [
+     0.867837,
+     -0.000789,
+     -0.000104
+    ],
+    [
+     -0.000789,
+     0.867579,
+     0.000104
+    ],
+    [
+     -0.000104,
+     0.000104,
+     1.127922
+    ]
+   ],
+   "model_scale": 0.946983,
+   "alike_model_poses": [
+    [
+     [
+      0.0172845,
+      -0.0395698,
+      -0.9990668,
+      -0.3000476
+     ],
+     [
+      -0.2128373,
+      0.9761701,
+      -0.0423468,
+      -0.2293722
+     ],
+     [
+      0.9769349,
+      0.2133712,
+      0.0084502,
+      0.5735439
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    [
+     [
+      0.0438874,
+      0.0192488,
+      -0.9988502,
+      -0.3000361
+     ],
+     [
+      0.2144215,
+      -0.9766958,
+      -0.0093998,
+      -0.229551
+     ],
+     [
+      -0.9757547,
+      -0.2137634,
+      -0.0469916,
+      0.5731636
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    [
+     [
+      -0.0601088,
+      0.0231675,
+      0.9979221,
+      -0.2999663
+     ],
+     [
+      0.4915852,
+      -0.8694047,
+      0.0497947,
+      -0.2294897
+     ],
+     [
+      0.8687523,
+      0.4935571,
+      0.0408687,
+      0.5735633
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   ],
+   "scaled_extent_m": [
+    0.06005,
+    0.06004,
+    0.01993
+   ],
+   "calibration_chamfer_mm": {
+    "trimmed_mean": 0.7,
+    "p95": 1.69,
+    "features": 2.58
+   },
+   "gazebo": {
+    "T_world_link": [
+     [
+      7.22e-05,
+      -0.0002806,
+      1.0,
+      -0.3000165
+     ],
+     [
+      -0.0792444,
+      0.9968552,
+      0.0002855,
+      -0.7012462
+     ],
+     [
+      -0.9968552,
+      -0.0792444,
+      4.98e-05,
+      1.1486607
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "T_link_model": [
+     [
+      -0.874653,
+      0.484749,
+      0.000522,
+      -4.8e-05
+     ],
+     [
+      -0.484748,
+      -0.874648,
+      -0.003285,
+      -0.000217
+     ],
+     [
+      -0.001136,
+      -0.003127,
+      0.999994,
+      5.7e-05
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "moved_during_capture": {
+    "mm": 0.0,
+    "deg": 0.0
+   },
+   "depth_check": {
+    "rendered_px": 1001,
+    "seen_px": 749,
+    "median_abs_mm": 2.22,
+    "p90_abs_mm": 5.27
+   }
+  },
+  {
+   "index": 1,
+   "name": "bar",
+   "mesh_file": "mesh_bar.f32i32.zlib",
+   "mesh_source": "agent/knowledge/demos/ring_insertion/model/obj_2/scaled_mesh.obj",
+   "model_pose": [
+    [
+     -0.999995,
+     -0.001981,
+     0.002355,
+     -0.302819
+    ],
+    [
+     0.0022007,
+     -0.9952486,
+     0.0973391,
+     -0.2310163
+    ],
+    [
+     0.0021514,
+     0.0973435,
+     0.9952479,
+     0.5700128
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "model_linear": [
+    [
+     0.882043,
+     0.000197,
+     -0.000461
+    ],
+    [
+     0.000197,
+     0.695347,
+     0.003489
+    ],
+    [
+     -0.000461,
+     0.003489,
+     0.694406
+    ]
+   ],
+   "model_scale": 0.75237,
+   "alike_model_poses": [
+    [
+     [
+      -0.9999628,
+      0.001718,
+      0.0083901,
+      -0.3028371
+     ],
+     [
+      0.0008938,
+      0.9952491,
+      -0.0973561,
+      -0.2301443
+     ],
+     [
+      -0.0085181,
+      -0.0973439,
+      -0.9952134,
+      0.5760305
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    [
+     [
+      0.9999962,
+      -0.001522,
+      -0.002243,
+      -0.2979731
+     ],
+     [
+      -0.0015977,
+      -0.9994296,
+      -0.033728,
+      -0.2306267
+     ],
+     [
+      -0.0021913,
+      0.0337322,
+      -0.9994279,
+      0.5760773
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    [
+     [
+      0.9999616,
+      0.001785,
+      -0.0085021,
+      -0.297954
+     ],
+     [
+      -0.0014968,
+      0.9994292,
+      0.033745,
+      -0.2305493
+     ],
+     [
+      0.008558,
+      -0.0337307,
+      0.9993933,
+      0.5699968
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   ],
+   "scaled_extent_m": [
+    0.34013,
+    0.02788,
+    0.03047
+   ],
+   "calibration_chamfer_mm": {
+    "trimmed_mean": 1.43,
+    "p95": 3.89,
+    "features": 11.05
+   },
+   "gazebo": {
+    "T_world_link": [
+     [
+      1.0,
+      0.0,
+      0.0,
+      -0.3
+     ],
+     [
+      0.0,
+      1.0,
+      0.0,
+      -0.7
+     ],
+     [
+      0.0,
+      0.0,
+      1.0,
+      1.15
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "T_link_model": [
+     [
+      -0.999995,
+      -0.001981,
+      0.002355,
+      -0.002819
+     ],
+     [
+      0.000447,
+      0.663745,
+      0.747958,
+      -0.003062
+     ],
+     [
+      -0.003045,
+      0.747956,
+      -0.663741,
+      0.001851
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "moved_during_capture": {
+    "mm": 0.0,
+    "deg": 0.0
+   },
+   "depth_check": {
+    "rendered_px": 3592,
+    "seen_px": 2352,
+    "median_abs_mm": 1.72,
+    "p90_abs_mm": 2.75
+   }
+  },
+  {
+   "index": 2,
+   "name": "tester",
+   "mesh_file": "mesh_tester.f32i32.zlib",
+   "mesh_source": "agent/knowledge/demos/pick_placement/model/obj_1/refined_model/model.obj",
+   "model_pose": [
+    [
+     0.000603,
+     -0.0048989,
+     0.999988,
+     -0.1907569
+    ],
+    [
+     0.596077,
+     0.8029192,
+     0.0035746,
+     0.0082744
+    ],
+    [
+     -0.8029271,
+     0.5960675,
+     0.0034043,
+     0.7476667
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "model_linear": [
+    [
+     2.807608,
+     0.001402,
+     -0.000242
+    ],
+    [
+     0.001402,
+     2.531896,
+     -0.008414
+    ],
+    [
+     -0.000242,
+     -0.008414,
+     2.006308
+    ]
+   ],
+   "model_scale": 2.425072,
+   "alike_model_poses": [],
+   "scaled_extent_m": [
+    0.05825,
+    0.05131,
+    0.15939
+   ],
+   "calibration_chamfer_mm": {
+    "trimmed_mean": 1.45,
+    "p95": 3.75,
+    "features": 7.07
+   },
+   "gazebo": {
+    "T_world_link": [
+     [
+      1.0,
+      9e-07,
+      0.0,
+      -0.1999999
+     ],
+     [
+      0.0,
+      -5.7e-06,
+      -1.0,
+      -0.7000185
+     ],
+     [
+      -9e-07,
+      1.0,
+      -5.7e-06,
+      0.8529994
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "T_link_model": [
+     [
+      0.000603,
+      -0.004898,
+      0.999988,
+      0.009243
+     ],
+     [
+      -0.010282,
+      -0.999935,
+      -0.004892,
+      0.000839
+     ],
+     [
+      0.999947,
+      -0.010279,
+      -0.000653,
+      -3e-05
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "moved_during_capture": {
+    "mm": 0.0,
+    "deg": 0.0
+   },
+   "depth_check": {
+    "rendered_px": 2229,
+    "seen_px": 2140,
+    "median_abs_mm": 2.27,
+    "p90_abs_mm": 4.78
+   }
+  },
+  {
+   "index": 3,
+   "name": "sample",
+   "mesh_file": "mesh_sample.f32i32.zlib",
+   "mesh_source": "agent/knowledge/demos/pick_placement/model/obj_2/refined_model/model.obj",
+   "model_pose": [
+    [
+     -0.999987,
+     -0.0040115,
+     -0.003245,
+     0.221034
+    ],
+    [
+     0.000269,
+     0.5875585,
+     -0.8091819,
+     0.0247998
+    ],
+    [
+     0.0051525,
+     -0.8091718,
+     -0.5875498,
+     0.7595392
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "model_linear": [
+    [
+     2.469129,
+     -0.000336,
+     0.000159
+    ],
+    [
+     -0.000336,
+     2.574283,
+     0.000159
+    ],
+    [
+     0.000159,
+     0.000159,
+     2.309476
+    ]
+   ],
+   "model_scale": 2.448525,
+   "alike_model_poses": [],
+   "scaled_extent_m": [
+    0.18175,
+    0.06216,
+    0.01097
+   ],
+   "calibration_chamfer_mm": {
+    "trimmed_mean": 1.07,
+    "p95": 2.65,
+    "features": 4.52
+   },
+   "gazebo": {
+    "T_world_link": [
+     [
+      1.0,
+      9e-06,
+      5e-07,
+      0.22
+     ],
+     [
+      5e-07,
+      6.34e-05,
+      -1.0,
+      -0.7
+     ],
+     [
+      -9e-06,
+      1.0,
+      6.34e-05,
+      0.8299926
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ],
+    "T_link_model": [
+     [
+      -0.999987,
+      -0.004012,
+      -0.003254,
+      0.001034
+     ],
+     [
+      -0.003255,
+      0.000211,
+      0.999995,
+      0.003498
+     ],
+     [
+      -0.004011,
+      0.999992,
+      -0.000224,
+      9.7e-05
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "moved_during_capture": {
+    "mm": 0.0,
+    "deg": 0.0
+   },
+   "depth_check": {
+    "rendered_px": 1571,
+    "seen_px": 1570,
+    "median_abs_mm": 1.67,
+    "p90_abs_mm": 3.16
+   }
+  }
+ ],
+ "others": {
+  "human": [
+   [
+    0.707107,
+    0.707107,
+    -0.0,
+    -0.335147
+   ],
+   [
+    0.415627,
+    -0.415627,
+    -0.809017,
+    1.077567
+   ],
+   [
+    -0.572061,
+    0.572061,
+    -0.587785,
+    0.728548
+   ],
+   [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  ]
+ }
+}

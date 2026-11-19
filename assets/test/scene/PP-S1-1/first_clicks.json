@@ -1,0 +1,55 @@
+{
+ "vlm_clicked": [
+  "tester",
+  "sample"
+ ],
+ "model": "qwen3.8-flash",
+ "seconds": 2.72,
+ "parts": {
+  "tester": {
+   "points": [
+    [
+     218,
+     221
+    ],
+    [
+     224,
+     229
+    ],
+    [
+     212,
+     237
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "sample": {
+   "points": [
+    [
+     421,
+     250
+    ],
+    [
+     433,
+     253
+    ],
+    [
+     410,
+     246
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  }
+ },
+ "reply": "tester: 341,462; 350,478; 332,495\nsample: 659,521; 678,528; 641,514"
+}

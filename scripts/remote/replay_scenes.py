@@ -1,4 +1,4 @@
-"""Replay each scene in assets/test through pose_server.py and render the poses.
+"""Replay each scene in assets/test/scene through pose_server.py and render the poses.
 
 Each scene folder holds what pose_client.py would send: order.json lists the
 init request's parts (meta_init.json, the frame, each mesh) and the track
@@ -233,8 +233,9 @@ def person_clicks(scene_dir, names, meshes, K, answer_from):
     return out
 
 
-def load_scene(scene_dir):
+def load_scene(scene_dir, init_list="init"):
     order = json.load(open(os.path.join(scene_dir, "order.json")))
+    order["init"] = order.get(init_list) or order["init"]
     meta_init = json.load(open(os.path.join(scene_dir, order["init"][0])))
     names = order["objects"]
     K = np.asarray(meta_init["K"], np.float64).reshape(3, 3)
@@ -263,9 +264,9 @@ def render_saved(scene_dir, out_dir):
 
 
 def run_scene(ctx, server, scene_dir, track_frames, out_dir, same_scale=False, true_size=False, drop_colours=False,
-              answer=None, timeout_ms=None):
+              answer=None, timeout_ms=None, init_list="init"):
     name = os.path.basename(scene_dir.rstrip("/"))
-    order, names, K, meshes = load_scene(scene_dir)
+    order, names, K, meshes = load_scene(scene_dir, init_list)
 
     init_parts = [open(os.path.join(scene_dir, p), "rb").read() for p in order["init"]]
     track_parts = [open(os.path.join(scene_dir, p), "rb").read() for p in order["track"]]
@@ -350,7 +351,7 @@ def run_scene(ctx, server, scene_dir, track_frames, out_dir, same_scale=False, t
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", default="tcp://127.0.0.1:5599")
-    ap.add_argument("--scenes", default=os.path.join(REPO, "assets", "test"))
+    ap.add_argument("--scenes", default=os.path.join(REPO, "assets", "test", "scene"))
     ap.add_argument("--track-frames", type=int, default=10)
     ap.add_argument("--out", required=True)
     ap.add_argument("--only", nargs="*")
@@ -364,6 +365,11 @@ def main():
     ap.add_argument("--render-only", action="store_true", help="re-render from the saved replies")
     ap.add_argument("--timeout-ms", type=int, default=None,
                     help="send timeout_ms with each track request, as pose_client.py does (its default 15000)")
+    ap.add_argument("--init-list", default="init",
+                    help="which of order.json's init lists to send (assets/test/scene/README.md): 'init' (the VLM's "
+                         "clicks, as the runs send them), 'init_located' (no clicks: located by the meshes) or "
+                         "'init_clean' (the VLM's clicks off the part by Gazebo's truth left out); 'init' where "
+                         "the scene has no such list")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     ctx = zmq.Context()
@@ -377,7 +383,8 @@ def main():
             print(f"[render] {render_saved(os.path.join(args.scenes, scene), args.out)}", flush=True)
             continue
         title, reply = run_scene(ctx, args.server, os.path.join(args.scenes, scene), args.track_frames, args.out, args.same_scale,
-                                 args.true_size, args.drop_colours, args.answer_clicks, args.timeout_ms)
+                                 args.true_size, args.drop_colours, args.answer_clicks, args.timeout_ms,
+                                 args.init_list)
         print(f"[replay] {title}", flush=True)
         if reply and reply.get("ok"):
             for n, b, l in zip(json.load(open(os.path.join(args.scenes, scene, "order.json")))["objects"],

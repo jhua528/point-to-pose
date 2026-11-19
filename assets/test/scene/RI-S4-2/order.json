@@ -1,0 +1,36 @@
+{
+ "init": [
+  "meta_init.json",
+  "rgb.jpg",
+  "depth.f32.zlib",
+  "mesh_bar.f32i32.zlib",
+  "mesh_ring.f32i32.zlib"
+ ],
+ "track": [
+  "meta_track.json",
+  "rgb.jpg",
+  "depth.f32.zlib"
+ ],
+ "objects": [
+  "bar",
+  "ring"
+ ],
+ "meshes": {
+  "bar": "/root/TM5-900/agent/knowledge/demos/ring_insertion/model/obj_2/scaled_mesh.obj",
+  "ring": "/root/TM5-900/agent/knowledge/demos/ring_insertion/model/obj_1/refined_model/model.obj"
+ },
+ "init_located": [
+  "meta_init_located.json",
+  "rgb.jpg",
+  "depth.f32.zlib",
+  "mesh_bar.f32i32.zlib",
+  "mesh_ring.f32i32.zlib"
+ ],
+ "init_clean": [
+  "meta_init_clean.json",
+  "rgb.jpg",
+  "depth.f32.zlib",
+  "mesh_bar.f32i32.zlib",
+  "mesh_ring.f32i32.zlib"
+ ]
+}

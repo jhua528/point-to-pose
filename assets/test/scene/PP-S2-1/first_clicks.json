@@ -1,0 +1,55 @@
+{
+ "vlm_clicked": [
+  "tester",
+  "sample"
+ ],
+ "model": "qwen3.8-flash",
+ "seconds": 2.91,
+ "parts": {
+  "tester": {
+   "points": [
+    [
+     220,
+     221
+    ],
+    [
+     224,
+     233
+    ],
+    [
+     217,
+     249
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  },
+  "sample": {
+   "points": [
+    [
+     410,
+     250
+    ],
+    [
+     427,
+     250
+    ],
+    [
+     443,
+     250
+    ]
+   ],
+   "on_part": [
+    true,
+    true,
+    true
+   ],
+   "dropped": []
+  }
+ },
+ "reply": "OBJECT tester: 345,462; 351,487; 340,519\nOBJECT sample: 642,521; 668,521; 694,521"
+}
