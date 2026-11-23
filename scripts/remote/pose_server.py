@@ -3492,21 +3492,53 @@ def _share_bound(share, count):
     return share + TOL_SIGMAS * float(np.sqrt(share * (1 - share) / int(count)))
 
 
+def p95_limit(terms, coarse=False):
+    """The 95th-percentile point distance (m) a pose -- a coarse one, if
+    `coarse` -- is taken at: in the view's TOL, and no more than its share of
+    the part's width where it is known (model_pose_rejection())."""
+    p95, share, floor = ((MODEL_COARSE_MAX_P95_DISTANCE_TOLS, MODEL_COARSE_MAX_P95_SHARE, MODEL_COARSE_P95_FLOOR_TOLS)
+                         if coarse else (MODEL_MAX_P95_DISTANCE_TOLS, MODEL_MAX_P95_SHARE, MODEL_P95_FLOOR_TOLS))
+    p95, floor = p95 * terms["tol"], floor * terms["tol"]
+    if "width" in terms:
+        p95 = min(p95, max(floor, share * terms["width"]))
+    return p95
+
+
+def points_stray(terms) -> bool:
+    """Whether a fit's points take in what is not the part: the mesh explains
+    them as a coarse pose would -- fitness, contradiction, penetration all
+    within -- but for a tail of them past its 95th-percentile distance
+    (p95_limit()). RR-S1-2's bar, a hand gripping its end, was fitted with
+    fitness 0.83-0.90 and its points 95-100 mm off at the 95th percentile (2-4
+    mm where nothing touched it, HS-S1-1): the hand's points in its segment,
+    they stretched its size across 0.83 for 0.61, its radius 17-21 mm for
+    13.5 (2026-11-22). Its click is to be made again (fit_boxes())."""
+    return (terms["p95_distance"] > p95_limit(terms, coarse=True)
+            and not model_pose_rejection(dict(terms, p95_distance=0.0), coarse=True))
+
+
+class FitRefusal(str):
+    """Why a mesh did not fit the view (fit_model_box()), whether its points
+    take in what is not the part (points_stray()), and the pose the mesh came
+    to on them, (R, t, scale) in the camera, or None."""
+
+    def __new__(cls, text, strays=False, pose=None):
+        out = super().__new__(cls, text)
+        out.strays = bool(strays)
+        out.pose = pose
+        return out
+
+
 def model_pose_rejection(terms, coarse=False):
     """Why the evidence falls short of a pose -- of a coarse one, if `coarse`
     -- or "" if it does not; not a judgement of the supplied object's identity.
     The shares are what is called a fit, the same for any part (the comment
     after MODEL_MIN_FITNESS); each is judged with its sampling error on as
     many points as the view has (_share_bound())."""
-    fitness, contradiction, penetration, p95, share, floor = (
-        (MODEL_COARSE_MIN_FITNESS, MODEL_COARSE_MAX_CONTRADICTION, MODEL_COARSE_MAX_PENETRATION,
-         MODEL_COARSE_MAX_P95_DISTANCE_TOLS, MODEL_COARSE_MAX_P95_SHARE, MODEL_COARSE_P95_FLOOR_TOLS) if coarse else
-        (MODEL_MIN_FITNESS, MODEL_MAX_CONTRADICTION, MODEL_MAX_PENETRATION, MODEL_MAX_P95_DISTANCE_TOLS,
-         MODEL_MAX_P95_SHARE, MODEL_P95_FLOOR_TOLS))
-    # In the view's TOL.
-    p95, floor = p95 * terms["tol"], floor * terms["tol"]
-    if "width" in terms:
-        p95 = min(p95, max(floor, share * terms["width"]))
+    fitness, contradiction, penetration = (
+        (MODEL_COARSE_MIN_FITNESS, MODEL_COARSE_MAX_CONTRADICTION, MODEL_COARSE_MAX_PENETRATION) if coarse else
+        (MODEL_MIN_FITNESS, MODEL_MAX_CONTRADICTION, MODEL_MAX_PENETRATION))
+    p95 = p95_limit(terms, coarse)
     failed = []
     fitness = 1 - _share_bound(1 - fitness, terms.get("obs_points"))
     contradiction = _share_bound(contradiction, terms.get("open_points"))
@@ -3586,7 +3618,8 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, locat
              f"p95 distance {terms['p95_distance'] * 1000:.1f} mm, "
              f"scale {_describe(scale)} ({terms['scale_note']}), {fit.observation_note}")
     if quality is None:
-        return None, f"{stats}; {model_pose_rejection(terms, coarse=True)}"
+        return None, FitRefusal(f"{stats}; {model_pose_rejection(terms, coarse=True)}", points_stray(terms),
+                                (R, t, scale))
     # The mesh's points are scaled before they are turned and moved: the
     # object is fitted_pose applied to fitted_linear @ the mesh, which for a
     # uniform scale is fitted_scale * the mesh.
@@ -3746,6 +3779,37 @@ def correct_max_m(model):
     the fitted mesh's far points turned that much about its centre."""
     diagonal = float(np.linalg.norm(fitted_axis_scale(model) * model.extent))
     return np.sin(np.radians(MODEL_CORRECT_MAX_DEG)) * diagonal / 2
+
+
+# The pose prior of a part the robot holds (meta["priors"][i]["source"]): sent
+# by a robot turning a part in the hand before the camera, where the tracker
+# lost it as it was picked (the fingers over it, its segment gone) and does
+# not look for it again while the fingertips touch it. Tried as any prior is
+# (apply_priors()), on the view where the mesh lies so (prior_region()).
+HOLD_PRIOR_SOURCE = "robot_hold"
+
+
+def prior_region(model, pose, metres, K):
+    """Where the part may be on this frame, the robot saying its mesh lies at
+    `pose` (camera frame; model.fitted_linear its shape): the mesh's
+    silhouette so, grown by half the part's own diagonal -- how far off a
+    hold of it may say -- of the pixels whose depth lies within that of the
+    mesh's nearest and farthest. A part in the hand the tracker has lost
+    there (its segment gone), turned before the camera to be seen."""
+    h, w = metres.shape
+    linear = getattr(model, "fitted_linear", None)
+    linear = np.eye(3) * (getattr(model, "fitted_scale", None) or 1.0) if linear is None else linear
+    rendered = mesh_depth(model, pose, linear, K, (h, w))
+    seen = np.isfinite(rendered)
+    if not seen.any():
+        return seen
+    reach = float(np.linalg.norm(fitted_axis_scale(model) * model.extent)) / 2
+    near, far = float(rendered[seen].min()), float(rendered[seen].max())
+    radius = max(1, int(np.ceil(float(K[0, 0]) * reach / max(near, 1e-3))))
+    grown = cv2.dilate(seen.astype(np.uint8),
+                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))) > 0
+    valid = np.isfinite(metres) & (metres > 0)
+    return grown & valid & (metres > near - reach) & (metres < far + reach)
 
 
 def correction_size(model, pose, corrected):
@@ -5476,6 +5540,8 @@ class PoseServer:
         in, and its box came out 730 mm long of 284.
         """
         self.mesh_session = getattr(self, "mesh_session", 0) + 1
+        # Clicked parts whose points took in what is not them (points_stray()).
+        self.init_strays = {}
         self.models = list(models)
         self.fitted_models = [None] * len(points)
         self.model_required = (list(model_required) if model_required is not None
@@ -5608,6 +5674,8 @@ class PoseServer:
                 self.model_retry_after[index] = time.monotonic() + MODEL_RETRY_INTERVAL_SEC
                 if fit is None:
                     self.model_errors[index] = reason
+                    if getattr(reason, "strays", False) and index not in (located or {}) and len(points[index]):
+                        self.init_strays[index] = reason
                     self.say(f"object {index}: mesh pose unlocalized in {seconds:.1f} s "
                              f"({reason}); tracking its points' box, retrying the mesh on fresh frames")
                     if view is not None:
@@ -5993,19 +6061,27 @@ class PoseServer:
         if getattr(self, "pose_priors", None) is None:
             self.pose_priors = {}
 
-    def frame_view(self, index, frame, regions, model):
+    def frame_view(self, index, frame, regions, model, prior=None):
         """(fit, mask, metres, K): object `index`'s view on this frame for
         `model` -- its mask less the others' regions and the robot, as
-        check_carried_meshes() takes it -- or None where it shows too little."""
+        check_carried_meshes() takes it -- or None where it shows too little.
+        Where the tracker has too little of it and the robot says where it
+        is (`prior`, its mesh pose in this frame's camera: a part in the
+        hand, lost to the tracker there), the view is taken where the mesh
+        lies so (prior_region())."""
         h, w = frame.depth.shape
         masks = as_numpy(getattr(frame, "mask", None))
         if masks.ndim == 4 and masks.shape[1] == 1:
             masks = masks[:, 0]
-        if masks.ndim != 3 or masks.shape[1:] != (h, w) or index >= len(masks):
+        tracked = masks.ndim == 3 and masks.shape[1:] == (h, w) and index < len(masks)
+        if not tracked and prior is None:
             return None
-        mask = self.without_robot(without_others(np.asarray(masks[index]) > 0, index, regions))
         metres = as_numpy(frame.depth) / frame.depth_factor
         K = np.asarray(frame.intrinsics, dtype=np.float64)
+        mask = (self.without_robot(without_others(np.asarray(masks[index]) > 0, index, regions)) if tracked
+                else np.zeros((h, w), bool))
+        if prior is not None and mask.sum() < MIN_BOX_POINTS:
+            mask = self.without_robot(without_others(prior_region(model, prior, metres, K), index, regions))
         fit = carried_view(model, mask, metres, K, others_region(index, regions))
         return None if fit is None else (fit, mask, metres, K)
 
@@ -6160,9 +6236,18 @@ class PoseServer:
                         shape = np.ones(3) * (model.known_scale or model.unit) if shape is None else shape
                         B = model.box[:3, :3]
                         model.fitted_linear, model.fitted_scale = (B * shape) @ B.T, _overall(shape)
-                view = self.frame_view(index, frame, regions, model)
+                # A part in the hand, lost to the tracker there, is looked for
+                # where the robot holds it (HOLD_PRIOR_SOURCE, prior_region()).
+                held = prior["pose"] if prior["source"] == HOLD_PRIOR_SOURCE else None
+                view = self.frame_view(index, frame, regions, model, prior=held)
                 if view is None:
                     prior["why"] = f"too little of it in view on frame {frame.id}"
+                    continue
+                if held is not None:
+                    # Fitted afresh on what the camera sees of it in the hand,
+                    # pose and size, and taken only where that fits it finely.
+                    self.fit_in_hand(index, view, motions[index], frame, prior)
+                    print(f"[server] object {index}: pose prior {prior['status']} ({prior['why']})", flush=True)
                     continue
                 best, why = self.best_on_view(model, view, [("prior", prior["pose"])])
                 if best is None:
@@ -6213,6 +6298,42 @@ class PoseServer:
             except Exception:
                 traceback.print_exc()
         return motions
+
+    def fit_in_hand(self, index, view, motion, frame, prior):
+        """A part the robot holds (a HOLD_PRIOR_SOURCE prior), seen where the
+        robot holds it (`view`, frame_view() on prior_region()): its mesh
+        fitted afresh there, pose and size as an init fits them, and taken --
+        a new fit, the part not lost on this frame (hold_seen) -- only where
+        that fits it finely. A coarse fit in the hand is no better than none:
+        RI-S1-1's ring, its pose corrected at the robot's (2026-11-20), came
+        out coarse, in and out of view, and in doubt which way round; the
+        robot planned on that, and failed, where it had planned on its hold.
+        The prior is spent either way: the robot sends the next."""
+        _, mask, metres, K = view
+        model = copy.copy(self.models[index])
+        seen = observe(mask, metres, K)
+        fit, reason = (fit_model_box(model, seen, K, known_shape=self.known_shape(model))
+                       if seen is not None else (None, "too little depth where it is held"))
+        if fit is None or model.fitted_quality != "fit":
+            prior.update(status="refused", why=f"in the hand on frame {frame.id}, "
+                                               + (f"its fit coarse: {fit[2]}" if fit is not None else reason))
+            return
+        motion = np.asarray(motion, dtype=np.float64)
+        model.fitted_pose = np.linalg.inv(motion) @ model.fitted_pose
+        model.fitted_id = model.fitted_id or uuid.uuid4().hex
+        B, scale = model.box[:3, :3], fitted_axis_scale(model)
+        T = np.eye(4)
+        T[:3, :3] = model.fitted_pose[:3, :3] @ B
+        T[:3, 3] = model.fitted_pose[:3, :3] @ (model.fitted_linear @ model.box[:3, 3]) + model.fitted_pose[:3, 3]
+        self.boxes[index] = (T, scale * model.extent)
+        self.fitted_models[index] = model
+        self.still_motions[index] = motion.copy()
+        self.model_errors[index] = None
+        self.model_withheld[index] = False
+        self.model_check_fails[index] = 0
+        self.model_corrections[index] = None
+        self.__dict__.setdefault("hold_seen", {})[index] = frame.id
+        prior.update(status="adopted", why=f"fitted in the hand on frame {frame.id}: {fit[2]}")
 
     def take_prior_as_fit(self, index, model, view, pose, motion, prior):
         """A pose prior on the part where the object has no fit on it: the
@@ -6924,6 +7045,40 @@ class PoseServer:
         self.boxes = self.fit_boxes(rgb, depth / depth_factor, K, meta["points"], meta["labels"],
                                     models, required, located, robot, carried,
                                     meanwhile=first_step if INIT_STEP_WITH_FITS else None)
+        # A clicked part whose points took in what is not it (points_stray())
+        # is clicked again -- by the Agent, else the person (NeedClick) --
+        # rather than tracked on them: its size and pose come out of what is
+        # not it. Once only: asked in the init before this one, it is tracked
+        # as before (its box, the mesh retried on fresh frames).
+        asked = getattr(self, "strays_asked", set())
+        strays = {index: why for index, why in self.init_strays.items() if index not in asked}
+        self.strays_asked = set(strays)
+        if strays:
+            # Where to click it again, offered: where the mesh came to on its
+            # points, the camera seeing it there at its depth (mesh_click()) --
+            # what touches the part shows nearer, and is left out. Without it
+            # the Agent's VLM was shown only the unnamed boxes in view, the
+            # part not among them, and every click fell to the person
+            # (RR-S1-2, 2026-11-23).
+            offered = {}
+            for index in strays:
+                pose = getattr(strays[index], "pose", None)
+                try:
+                    found = (mesh_click(models[index], *pose, depth / depth_factor, K)
+                             if pose is not None and models[index] is not None else None)
+                except Exception:
+                    traceback.print_exc()
+                    found = None
+                offered[index] = [] if found is None else [np.asarray(found[0]).tolist()]
+            for index in sorted(strays):
+                self.say(f"object {index}: its click's segment takes in what is not it "
+                         f"({strays[index].split('; ')[-1]}); asked to be clicked again"
+                         + (f", where its mesh came to offered at {offered[index][0]}" if offered[index] else ""))
+            raise NeedClick([{"object": index, "why": "its segment took in what is not it: click it again, "
+                                                      "away from whatever touches it", "candidates": offered[index]}
+                             for index in sorted(strays)],
+                            [[] if index in strays else np.asarray(p).tolist()
+                             for index, p in enumerate(self.init_points)])
         if not stepped:
             first_step()
         motions = stepped[0]
@@ -7490,6 +7645,11 @@ class PoseServer:
         lost = [bool(getattr(o, "lost", False)) for o in self.pipeline.objects]
         bboxes = self.bboxes(motions, frame)
         lost = self.recognition_lost(lost, bboxes)
+        # A part found in the hand where the robot holds it (HOLD_PRIOR_SOURCE)
+        # is not lost on that frame, though the tracker's points on it are.
+        seen_held = getattr(self, "hold_seen", None) or {}
+        lost = [bool(gone and not (seen_held.get(index) == frame.id and bboxes[index] is not None))
+                for index, gone in enumerate(lost)]
         self.note_last_fits(motions, lost)
         reply = {
             "ok": True,

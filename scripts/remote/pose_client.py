@@ -92,6 +92,11 @@ BINDING_ASKER_TOPIC = "/point2pose/binding_asker"
 # with the fit's (pose_sever's MODEL_CHECK_FAILS); what came of it is in the
 # model message's "prior".
 POSE_PRIOR_TOPIC = "/point2pose/pose_prior"
+# Its "source" where the robot holds the part (pose_sever's HOLD_PRIOR_SOURCE):
+# turning it in the hand before the camera, it says where the part is, lost to
+# the tracker there; sent on as any prior, but the part is not set down -- its
+# last-seen box and a click asked of it stay as they were.
+HOLD_PRIOR_SOURCE = "robot_hold"
 BINDING_COLOURS = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 128, 255), (128, 255, 0), (255, 128, 128)]
 # Box edges as corner-index pairs; the server orders corners so bit 0/1/2 of the
 # index flips x/y/z, hence edges join indices that differ in exactly one bit.
@@ -1056,6 +1061,8 @@ class PoseClient(Node):
             return
         self.pose_priors[name] = (np.asarray(pose, dtype=float), str(prior.get("source") or "client"))
         self.get_logger().info(f"{name}: pose prior from {self.pose_priors[name][1]}, sent with the next frame")
+        if self.pose_priors[name][1] == HOLD_PRIOR_SOURCE:
+            return                                  # still in the hand: not set down
         self.set_down_seen(name, self.pose_priors[name][0])
         wait = self.awaiting_clicks
         if wait is not None and name in wait["asked"] and wait["points"][self.object_names.index(name)] is None:
