@@ -152,6 +152,30 @@ def anchor_from_points(points, labels, depth, K, depth_factor, radius=3):
     return anchor
 
 
+def click_pixels(points, labels):
+    """The positive clicks of an object, (N, 2) pixels (u, v): where the
+    person, the Agent or the locator said the part is (connected_depth_foreground()'s
+    `anchors`)."""
+    if points is None or labels is None:
+        return np.zeros((0, 2))
+    out = [(float(p[0]), float(p[1])) for p, label in zip(points, labels) if label]
+    return np.asarray(out, np.float64).reshape(-1, 2)
+
+
+def anchor_pixel(motion, anchor, K):
+    """Where the object's anchor -- its clicked point (anchor_from_points()),
+    carried by its tracked `motion` -- falls in this frame's image, (1, 2)
+    pixels; empty where it cannot (behind the camera, no motion)."""
+    try:
+        p = (np.asarray(motion, np.float64) @ np.asarray(anchor, np.float64))[:3, 3]
+    except Exception:
+        return np.zeros((0, 2))
+    if not np.isfinite(p).all() or p[2] <= 1e-6:
+        return np.zeros((0, 2))
+    K = np.asarray(K, np.float64)
+    return np.array([[p[0] / p[2] * K[0, 0] + K[0, 2], p[1] / p[2] * K[1, 1] + K[1, 2]]])
+
+
 # Unit-cube corner signs, ordered so bit 0/1/2 of the index flips x/y/z.
 _CORNER_SIGNS = np.array([[(i >> k & 1) * 2 - 1 for k in range(3)] for i in range(8)], np.float64)
 
@@ -1922,7 +1946,7 @@ def _signed_permutations():
     return out
 
 
-def connected_depth_foreground(mask, depth, cam=None, through=None, tol=None):
+def connected_depth_foreground(mask, depth, cam=None, through=None, tol=None, anchors=None):
     """Remove small mask islands separated by a depth jump from the main part.
 
     A 2D connected mask can cross an occluder's boundary. Use adjacent valid
@@ -1935,19 +1959,26 @@ def connected_depth_foreground(mask, depth, cam=None, through=None, tol=None):
     as the mask's own pixels would: RR-S1-2's bar, cut in two by the ring
     round it, had its far piece dropped -- the ring hugs the bar, no
     MODEL_HIDDEN_TOLS nearer -- and was fitted 213 mm long of 330.
+
+    `anchors`, (N, 2) pixels where the part was clicked -- or its clicked
+    point carried by its tracked motion (anchor_pixel()) -- say which piece
+    is the part: the pieces they fall on (or within SEGMENT_EDGE_PX of) are
+    kept, as are those the part continues into behind an occluder, and none
+    else, whatever share of the mask they are. Without them, or none falling
+    on the mask, the largest piece is kept where it is MODEL_COMPONENT_MIN_SHARE of
+    the mask or more. By share alone, RI-S4-1's ring, 40% behind a box, was
+    68% of its mask and nothing was cut (20261125); a hand larger than the
+    part it holds would have been kept in its place.
     """
     region = mask if through is None else mask | through
     gap_share = depth_gap_share(cam=cam)
-    # Two neighbours' depths differ by their noise as well, sqrt(2) of it; the
-    # TOL given covers TOL_SIGMAS of the noise.
-    gap_noise = np.sqrt(2.0) * (tol or 0.0)
+    if tol is None and cam is not None:
+        tol = max(noise_tol(depth, region, (1,)) or 0.0, cam_pixel_tol(cam, region))
     count = int(region.sum())
     indices = np.full(mask.shape, -1, dtype=np.int32)
     indices[region] = np.arange(count)
     sources, targets = [], []
-    for a, b in ((np.s_[:-1, :], np.s_[1:, :]), (np.s_[:, :-1], np.s_[:, 1:])):
-        linked = region[a] & region[b] & (np.abs(depth[a] - depth[b])
-                                          <= gap_share * np.maximum(depth[a], depth[b]) + gap_noise)
+    for a, b, linked in surface_links(region, depth, tol, gap_share):
         sources.append(indices[a][linked])
         targets.append(indices[b][linked])
     sources, targets = np.concatenate(sources), np.concatenate(targets)
@@ -1955,20 +1986,120 @@ def connected_depth_foreground(mask, depth, cam=None, through=None, tol=None):
     _, labels = connected_components(graph, directed=False)
     own = mask[region]                            # the order of `indices`
     sizes = np.bincount(labels[own], minlength=labels.max() + 1 if count else 0)
-    if not len(sizes) or sizes.max() < max(MIN_BOX_POINTS, MODEL_COMPONENT_MIN_SHARE * int(mask.sum())):
+    if not len(sizes):
         return mask
     main = sizes.argmax()
-    keep = labels == main
+    # The segment's edge spill: a piece a depth jump off the main one, no
+    # wider than SEGMENT_EDGE_PX along its edge -- what lies just past the
+    # part's outline, in front of it or behind -- is not the part, however
+    # many such pixels there are. RI-S4-1's ring, standing 40% behind a box,
+    # was 68% of its mask: the box's top edge below it and the room seen past
+    # it above, and through its hole, kept as evidence since no piece
+    # dominated -- fitted 50 mm off at the 95th percentile, its size 0.87 of
+    # true, refused every frame of all three runs (20261125). A hand round a
+    # bar is a piece wider than that, and is no spill.
+    ys, xs = np.nonzero(region)
+    pixels = np.column_stack([xs, ys])
+    anchored = _anchored_pieces(anchors, pixels, labels, own, mask.shape)
+    if anchored:
+        main = max(anchored, key=lambda label: sizes[label])
+        keep = np.isin(labels, list(anchored))
+        return _with_behind(keep, main, labels, own, sizes, region, mask, xs, ys, depth, cam, tol, gap_share)
+    spill = np.zeros(count, dtype=bool)
+    if sizes[main] < int(mask.sum()):
+        main_tree = cKDTree(pixels[(labels == main) & own])
+        band = image_px(SEGMENT_EDGE_PX, mask.shape)
+        for label in np.flatnonzero(sizes):
+            piece = (labels == label) & own
+            if label != main and main_tree.query(pixels[piece])[0].max() <= band:
+                spill |= labels == label
+    if sizes[main] < max(MIN_BOX_POINTS, MODEL_COMPONENT_MIN_SHARE * int((own & ~spill).sum())):
+        if not spill.any():
+            return mask
+        result = np.zeros_like(mask)
+        result[region] = ~spill
+        return result & mask
+    return _with_behind(labels == main, main, labels, own, sizes, region, mask, xs, ys, depth, cam, tol, gap_share)
+
+
+def surface_links(region, depth, tol, gap_share=MODEL_DEPTH_GAP_SHARE):
+    """[(a, b, linked)] for neighbours down and across `region`: whether the
+    two pixels at slices a and b are one surface, by their depths. One where
+    their step is within the noise (sqrt(2) of the TOL `tol`, TOL_SIGMAS of
+    it, and the depth's own quantum), or goes on the slope of the pixel
+    before or after them -- a surface turned however far from the camera
+    steps evenly across it, the step's change within the noise of three
+    depths (sqrt(6) of the TOL) and, curved, within the step beside it. An
+    edge is a leap off both: a hand in front of a part, the room seen past
+    its edge, a box's top behind it.
+
+    Linked by a share of their depth instead (MODEL_DEPTH_GAP_DEG), 3 cm at
+    0.6 m, a box's top edge 25 cm before RI-S4-1's ring and the room 10 cm
+    behind it were joined to it pixel by pixel (20261126); that share stays
+    where the TOL is not known."""
+    if not tol:
+        out = []
+        for a, b in ((np.s_[:-1, :], np.s_[1:, :]), (np.s_[:, :-1], np.s_[:, 1:])):
+            out.append((a, b, region[a] & region[b]
+                        & (np.abs(depth[a] - depth[b]) <= gap_share * np.maximum(depth[a], depth[b]))))
+        return out
+    quantum = depth_quantum(depth, region)
+    flat = np.sqrt(2.0) * tol + quantum
+    even = np.sqrt(6.0) * tol + 2 * quantum
+    ok = region & np.isfinite(depth) & (depth > 0)
+    out = []
+    for axis in (0, 1):
+        z = np.moveaxis(np.where(ok, depth, np.nan), axis, 0)
+        on = np.moveaxis(ok, axis, 0)
+        step = z[1:] - z[:-1]                                   # pixel p to p + 1
+        both = on[1:] & on[:-1]
+        before = np.full_like(step, np.nan)
+        before[1:] = step[:-1]                                  # p - 1 to p
+        after = np.full_like(step, np.nan)
+        after[:-1] = step[1:]                                   # p + 1 to p + 2
+        with np.errstate(invalid="ignore"):
+            # A curved surface turning away -- a ring's rim, a bar's side seen
+            # past the middle -- steps further each pixel: the step may grow
+            # by as much as the one beside it, besides the noise. At an edge
+            # it leaps by many times that: RI-S4-1's ring's rim stepped 5 to
+            # 12 mm a pixel, its edge to the room behind 100 mm from 1 mm.
+            # The lesser of the two steps: an edge's leap is no measure of the
+            # step beside it (RI-S4-1: 4 mm, 40 mm, then 268 mm onto the box).
+            linked = both & ((np.abs(step) <= flat)
+                             | (np.abs(step - before) <= even + np.minimum(np.abs(before), np.abs(step)))
+                             | (np.abs(step - after) <= even + np.minimum(np.abs(after), np.abs(step))))
+        linked = np.moveaxis(linked, 0, axis)
+        a, b = (np.s_[:-1, :], np.s_[1:, :]) if axis == 0 else (np.s_[:, :-1], np.s_[:, 1:])
+        out.append((a, b, linked))
+    return out
+
+
+def _anchored_pieces(anchors, pixels, labels, own, shape) -> set:
+    """The labels of the pieces `anchors` ((N, 2) pixels) fall on, of the
+    mask's own pixels -- or, off them, the nearest within SEGMENT_EDGE_PX."""
+    anchors = np.asarray(anchors if anchors is not None else (), np.float64).reshape(-1, 2)
+    anchors = anchors[np.isfinite(anchors).all(1)]
+    if not len(anchors) or not own.any():
+        return set()
+    tree = cKDTree(pixels[own])
+    dist, nearest = tree.query(anchors)
+    near = dist <= image_px(SEGMENT_EDGE_PX, shape)
+    return {int(label) for label in labels[own][nearest[near]]}
+
+
+def _with_behind(keep, main, labels, own, sizes, region, mask, xs, ys, depth, cam, tol, gap_share):
+    """connected_depth_foreground()'s result: `keep` (over the region's
+    pixels), and each piece the part (`main`) continues into behind an
+    occluder (_behind_occluder())."""
     if cam is not None:
-        ys, xs = np.nonzero(region)
         main_px = np.column_stack([xs[keep & own], ys[keep & own]])
         tree = cKDTree(main_px)
         for label in np.flatnonzero(sizes >= image_area_px(MODEL_BEHIND_MIN_PX, mask.shape)):
             if tol is None:
                 tol = max(noise_tol(cam[..., 2], region, (1,)) or 0.0, cam_pixel_tol(cam, region))
-            if label != main and _behind_occluder(np.column_stack([xs, ys])[(labels == label) & own],
-                                                  main_px, tree, depth, cam, tol, gap_share):
-                keep |= labels == label
+            if not keep[np.flatnonzero(labels == label)[0]] and _behind_occluder(
+                    np.column_stack([xs, ys])[(labels == label) & own], main_px, tree, depth, cam, tol, gap_share):
+                keep = keep | (labels == label)
     result = np.zeros_like(mask)
     result[region] = keep
     return result & mask
@@ -1999,7 +2130,7 @@ class _ModelFit:
     """Fits one mesh to one object's view; see fit_model_box()."""
 
     def __init__(self, model, view, K, rng, through=None, scale_hint=None, located=None, image=None,
-                 known_shape=None):
+                 known_shape=None, anchors=None):
         cam, mask, keep, plane, _ = view
         self.lab = (None if image is None or model.lab is None else
                     cv2.cvtColor(np.asarray(image, np.float32) / 255.0, cv2.COLOR_RGB2LAB).astype(np.float64))
@@ -2071,7 +2202,7 @@ class _ModelFit:
         # The part is one surface in depth whether or not it rests on a support:
         # held up, its mask's spill onto the room behind, metres off and as
         # noisy as a depth camera is there, made a box 7 m long (2026-11-18).
-        obs_mask = connected_depth_foreground(obs_mask, self.depth, cam, through, self.tol)
+        obs_mask = connected_depth_foreground(obs_mask, self.depth, cam, through, self.tol, anchors)
         # Where the part's size is known, nothing further from its middle than
         # its diagonal is the part's: a strip of the box behind RI-S4-1's ring,
         # 370 mm long, joined it in depth and was fitted as its (2026-11-17).
@@ -2482,6 +2613,35 @@ class _ModelFit:
             if len(idx):
                 t = t + target - P[idx].mean(0)
         return t
+
+    def drop_edge_spill(self, scale, R, t, limit) -> int:
+        """Drop the observed points the segment's edge spilt onto: in its
+        outermost SEGMENT_EDGE_PX and further from the mesh as fitted than
+        `limit` (the coarse p95_limit()); how many. A point far off inside
+        the segment, or one near the mesh on its edge, is kept: a hand round
+        a bar is still its points' stray tail, and is clicked again.
+        RI-S4-1's ring, 40% behind a box, kept the room seen past its edge,
+        chained to it in depth, as 5% of its points: fitted 2 mm off where it
+        stood, its 95th percentile 46-50 mm out, refused (20261125)."""
+        band = image_px(SEGMENT_EDGE_PX, self.mask.shape)
+        inner = cv2.erode(self.mask.astype(np.uint8), np.ones((2 * band + 1,) * 2, np.uint8)) > 0
+        edge = self.mask & ~inner
+        z = np.maximum(self.obs[:, 2], 1e-9)
+        u = np.round(self.obs[:, 0] / z * self.K[0, 0] + self.K[0, 2]).astype(int)
+        v = np.round(self.obs[:, 1] / z * self.K[1, 1] + self.K[1, 2]).astype(int)
+        h, w = self.mask.shape
+        on_edge = np.zeros(len(self.obs), dtype=bool)
+        inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        on_edge[inside] = edge[v[inside], u[inside]]
+        P = self.model.points @ (R @ self.linear(scale)).T + t
+        far = cKDTree(P).query(self.obs)[0] > limit
+        drop = on_edge & far
+        if not drop.any() or (~drop).sum() < MIN_BOX_POINTS:
+            return 0
+        self.obs = self.obs[~drop]
+        self.obs_tree = cKDTree(self.obs)
+        self.observation_note += f", {int(drop.sum())} spilt past its edge dropped"
+        return int(drop.sum())
 
     def terms(self, scale, R, t, mesh_n, obs_n):
         """Correspondences of one pose and its cost; see the comment above
@@ -3557,7 +3717,7 @@ def model_pose_rejection(terms, coarse=False):
 
 
 def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, located=None, image=None,
-                  known_shape=None, budget=None):
+                  known_shape=None, budget=None, anchors=None):
     """Box of one object from its mesh: ((T_cam_box, extent, note), None) if
     the mesh fits the view, (None, reason) if not.
 
@@ -3577,12 +3737,17 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, locat
     model.fitted_doubts, model.fitted_unlikely = [], []
     model.fitted_known_shape = None
     fit = _ModelFit(model, view, K, rng or np.random.default_rng(0), through, scale_hint, located, image,
-                    known_shape)
+                    known_shape, anchors)
     fit.budget = budget                    # MODEL_INIT_FIT_BUDGET_SEC, at the init only
     result = fit.run()
     if result is None:
         return None, "no pose left any mesh point in view"
     terms, R, t, scale, quality = result
+    if points_stray(terms) and fit.drop_edge_spill(scale, R, t, p95_limit(terms, coarse=True)):
+        # Fitted again on what is left (drop_edge_spill()).
+        again = fit.run()
+        if again is not None:
+            terms, R, t, scale, quality = again
     if quality is not None:
         narrowed = fit.narrow_tol(terms, R, t, scale)
         if narrowed is not None:
@@ -3685,7 +3850,7 @@ def fit_model_box(model, view, K, rng=None, through=None, scale_hint=None, locat
 
 
 def retry_mesh_fit(model, mask, metres, K, through=None, scale_hint=None, located=None, image=None,
-                   known_shape=None):
+                   known_shape=None, anchors=None):
     """Worker owns its model state and frame snapshot, never the live pipeline."""
     model = copy.copy(model)
     try:
@@ -3693,7 +3858,7 @@ def retry_mesh_fit(model, mask, metres, K, through=None, scale_hint=None, locate
         if view is None:
             return None, "insufficient current depth", model
         fit, reason = fit_model_box(model, view, K, through=through, scale_hint=scale_hint, located=located,
-                                    image=image, known_shape=known_shape)
+                                    image=image, known_shape=known_shape, anchors=anchors)
         return fit, reason, model
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}", model
@@ -3741,13 +3906,15 @@ def turn_kind(model, D):
     return None if round_axis(model, scale) == long_k else "spin"
 
 
-def carried_view(model, mask, metres, K, through=None):
+def carried_view(model, mask, metres, K, through=None, anchors=None):
     """This frame's view of a fitted part, as a _ModelFit to score or
-    correct its carried pose on; None where the view shows too little."""
+    correct its carried pose on; None where the view shows too little.
+    `anchors`: where its clicked point falls in this frame (anchor_pixel()),
+    to say which depth piece of its mask it is (connected_depth_foreground())."""
     view = observe(mask, metres, K)
     if view is None:
         return None
-    fit = _ModelFit(model, view, K, np.random.default_rng(0), through)
+    fit = _ModelFit(model, view, K, np.random.default_rng(0), through, anchors=anchors)
     # How far the mesh lies off its part is the mesh's, as its fit settled it
     # (narrow_tol()); the sensor's part is this frame's.
     settled = getattr(model, "fitted_tol", None)
@@ -3822,7 +3989,7 @@ def correction_size(model, pose, corrected):
     return float(move), float(turn)
 
 
-def carried_fit_rejection(model, pose, mask, metres, K, through=None, fit=None, scale=None):
+def carried_fit_rejection(model, pose, mask, metres, K, through=None, fit=None, scale=None, anchors=None):
     """Why the fitted mesh, at `pose` in this frame's camera (its fit carried
     here by the tracked motion), no longer lies on what the camera sees of
     the part; "" where it does, or where the view shows too little to say.
@@ -3835,7 +4002,7 @@ def carried_fit_rejection(model, pose, mask, metres, K, through=None, fit=None, 
     contradiction (a ring 5 mm deep: over 0.25), and a part held up has for
     its "support" whatever is behind it."""
     if fit is None:
-        fit = carried_view(model, mask, metres, K, through)
+        fit = carried_view(model, mask, metres, K, through, anchors)
     if fit is None:
         return ""
     terms = fit.terms(fitted_axis_scale(model) if scale is None else scale, pose[:3, :3], pose[:3, 3],
@@ -3843,10 +4010,18 @@ def carried_fit_rejection(model, pose, mask, metres, K, through=None, fit=None, 
     if terms is None:
         return "no mesh point in view"
     failed = []
-    if terms["fitness"] < MODEL_COARSE_MIN_FITNESS:
-        failed.append(f"fitness {terms['fitness']:.2f} < {MODEL_COARSE_MIN_FITNESS:.2f}")
     p95 = min(MODEL_COARSE_MAX_P95_DISTANCE_TOLS * fit.tol,
               max(MODEL_COARSE_P95_FLOOR_TOLS * fit.tol, MODEL_COARSE_MAX_P95_SHARE * terms["width"]))
+    if terms["p95_distance"] > p95:
+        # The tracked segment's edge spill, as at the fit (drop_edge_spill()):
+        # RI-S4-1's ring, fitted 4 mm at the 95th percentile, was withheld
+        # every frame after at 54-56 mm, the room past its edge in its
+        # tracked mask (20261125).
+        scale_now = fitted_axis_scale(model) if scale is None else scale
+        if fit.drop_edge_spill(scale_now, pose[:3, :3], pose[:3, 3], p95):
+            terms = fit.terms(scale_now, pose[:3, :3], pose[:3, 3], *MODEL_CHECK_POINTS) or terms
+    if terms["fitness"] < MODEL_COARSE_MIN_FITNESS:
+        failed.append(f"fitness {terms['fitness']:.2f} < {MODEL_COARSE_MIN_FITNESS:.2f}")
     if terms["p95_distance"] > p95:
         failed.append(f"95th-percentile point distance {terms['p95_distance'] * 1000:.0f} mm > {p95 * 1000:.0f} mm")
     return "; ".join(failed)
@@ -5607,7 +5782,8 @@ class PoseServer:
             if not self.model_required[index]:
                 continue
             try:
-                why = carried_fit_rejection(fit["model"], fit["pose"], masks[index], metres, K, through=cut[index])
+                why = carried_fit_rejection(fit["model"], fit["pose"], masks[index], metres, K, through=cut[index],
+                                            anchors=click_pixels(points[index], labels[index]))
             except Exception as exc:
                 traceback.print_exc()
                 why = f"{type(exc).__name__}: {exc}"
@@ -5624,7 +5800,8 @@ class PoseServer:
         calls = [functools.partial(
             fit_model_box, models[index], views[index], K, through=cut[index],
             scale_hint=self.scale_hints[index], located=getattr(self, "locate_shapes", {}).get(index),
-            image=rgb, known_shape=self.shape_hints[index], budget=MODEL_INIT_FIT_BUDGET_SEC) for index in fitting]
+            image=rgb, known_shape=self.shape_hints[index], budget=MODEL_INIT_FIT_BUDGET_SEC,
+            anchors=click_pixels(points[index], labels[index])) for index in fitting]
         if meanwhile is None or not calls:
             fits = dict(zip(fitting, side_by_side(calls)))
         else:
@@ -5825,7 +6002,7 @@ class PoseServer:
                 retry_mesh_fit, self.models[index], mask, metres, np.array(frame.intrinsics, copy=True),
                 others_region(index, regions), self.scale_hints[index],
                 getattr(self, "locate_shapes", {}).get(index), np.array(frame.rgb, copy=True),
-                self.known_shape(self.models[index]))
+                self.known_shape(self.models[index]), self.frame_anchor(index, frame, motion))
             self.mesh_fit_job = (future, index, self.mesh_session, capture_inverse, frame.id)
             print(f"[server] object {index}: retrying mesh pose on frame {frame.id}", flush=True)
         except Exception as exc:
@@ -5874,6 +6051,8 @@ class PoseServer:
         dropped and fitted again now. Returns the motions, each fitted
         object's carrying its corrected mesh pose."""
         motions = np.array(motions, dtype=np.float64)
+        # Where each part's clicked point is on this frame (frame_anchor()).
+        self.frame_motions = (frame.id, motions.copy())
         models = getattr(self, "fitted_models", None)
         if not models:
             return motions
@@ -5918,7 +6097,8 @@ class PoseServer:
                 kept = corrections[index]
                 start = carried @ kept[1] if kept is not None and kept[0] == fit_id else carried
                 mask = self.without_robot(without_others(np.asarray(masks[index]) > 0, index, regions))
-                fit = carried_view(model, mask, metres, K, others_region(index, regions))
+                fit = carried_view(model, mask, metres, K, others_region(index, regions),
+                                   self.frame_anchor(index, frame, motion))
                 pose, held_here = start, False
                 if fit is not None:
                     pose, cost = correct_carried_pose(fit, model, start)
@@ -6061,6 +6241,18 @@ class PoseServer:
         if getattr(self, "pose_priors", None) is None:
             self.pose_priors = {}
 
+    def frame_anchor(self, index, frame, motion=None):
+        """Where object `index`'s clicked point falls in `frame` (anchor_pixel()):
+        by `motion`, else by the motions check_carried_meshes() was given for
+        this frame; empty where neither is known."""
+        anchors = getattr(self, "anchors", None)
+        if motion is None:
+            kept = getattr(self, "frame_motions", None)
+            motion = kept[1][index] if kept is not None and kept[0] == frame.id and index < len(kept[1]) else None
+        if anchors is None or motion is None or index >= len(anchors):
+            return np.zeros((0, 2))
+        return anchor_pixel(motion, anchors[index], np.asarray(frame.intrinsics, np.float64))
+
     def frame_view(self, index, frame, regions, model, prior=None):
         """(fit, mask, metres, K): object `index`'s view on this frame for
         `model` -- its mask less the others' regions and the robot, as
@@ -6082,7 +6274,7 @@ class PoseServer:
                 else np.zeros((h, w), bool))
         if prior is not None and mask.sum() < MIN_BOX_POINTS:
             mask = self.without_robot(without_others(prior_region(model, prior, metres, K), index, regions))
-        fit = carried_view(model, mask, metres, K, others_region(index, regions))
+        fit = carried_view(model, mask, metres, K, others_region(index, regions), self.frame_anchor(index, frame))
         return None if fit is None else (fit, mask, metres, K)
 
     def best_on_view(self, model, view, candidates):
@@ -6417,7 +6609,8 @@ class PoseServer:
                 if (observe and len(binding.living()) > 1 and index < len(lost) and not lost[index]
                         and not withheld[index] and np.isfinite(motion).all()):
                     mask = self.without_robot(without_others(np.asarray(masks[index]) > 0, index, regions))
-                    fit = carried_view(model, mask, metres, K, others_region(index, regions))
+                    fit = carried_view(model, mask, metres, K, others_region(index, regions),
+                                       self.frame_anchor(index, frame, motion))
                     if fit is not None:
                         at_rest = robot is None or robot.shape != fit.grown.shape or not (fit.grown & robot).any()
                         if binding.observe(fit, motion @ model.fitted_pose, at_rest):
