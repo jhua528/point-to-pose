@@ -822,6 +822,8 @@ class PoseClient(Node):
             extra = self.mesh_frames(meta)
             meta["discover"] = self.args.obstacles
             meta["same_scale_meshes"] = self.args.same_scale_meshes
+            if getattr(self.args, "baseline", False):
+                meta["baseline"] = True         # the unmodified Point2Pose (pose_sever.BASELINE)
             robot_note = "not known"
             if robot is not None:
                 meta["robot_mask"] = encode_mask(robot)
@@ -853,6 +855,12 @@ class PoseClient(Node):
             self.get_logger().error(f"server error: {reply.get('error')}")
             self.relocation_failed()
             return
+        if meta["cmd"] == "init" and getattr(self.args, "baseline", False) and reply.get("baseline") is not True:
+            # A server without the baseline mode tracks as the full method: the
+            # comparison would be the full method under the baseline's name.
+            self.get_logger().fatal("--baseline asked for, but the server does not run as the unmodified "
+                                    "Point2Pose (its pose_sever.py predates the baseline mode): stopping")
+            raise SystemExit(2)
         stale = reply.get("stale")
         if isinstance(stale, dict) and meta["cmd"] == "track":
             # The server is still on an earlier frame: these are that frame's
@@ -1904,6 +1912,9 @@ def main():
                          "frame, and with no --points is located by it. Failed pose fits remain "
                          "unrecognised while the server retries on fresh frames; "
                          "there is no point-cloud box fallback")
+    ap.add_argument("--baseline", action="store_true",
+                    help="the unmodified Point2Pose, for the A2 comparison: one uniform scale per mesh, no "
+                         "per-frame depth correction, no ways round in doubt, no click requests, no pose priors")
     ap.add_argument("--same-scale-meshes", action="store_true",
                     help="the meshes of --models come from one reconstruction, so are off the parts' "
                          "true sizes by about one factor: a part's scale is then checked against the "

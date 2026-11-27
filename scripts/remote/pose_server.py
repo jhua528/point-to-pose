@@ -3923,6 +3923,14 @@ def carried_view(model, mask, metres, K, through=None, anchors=None):
     return fit
 
 
+# The unmodified Point2Pose's behaviour, for the paper's A2 comparison (an init's
+# meta["baseline"]: true): one uniform scale per mesh, no per-frame depth
+# correction (correct_carried_pose() scores the pose as carried), no ways round
+# in doubt or bindings in the reply, no click asked for (the best-fitting place
+# taken), no pose priors. Set by each init; off by default.
+BASELINE = False
+
+
 def correct_carried_pose(fit, model, pose, scale=None):
     """The carried mesh pose corrected on this frame's view `fit`
     (carried_view()), and its cost there; `pose` itself where the correction
@@ -3932,6 +3940,8 @@ def correct_carried_pose(fit, model, pose, scale=None):
     start = fit.terms(scale, pose[:3, :3], pose[:3, 3], *MODEL_CHECK_POINTS)
     if start is None:
         return pose, np.inf
+    if BASELINE:
+        return pose, float(start["cost"])
     R, t, terms = fit.icp(scale, pose[:3, :3], pose[:3, 3], MODEL_CORRECT_ROUNDS,
                           *MODEL_CHECK_POINTS, MODEL_CORRECT_RADIUS_TOLS * fit.tol)
     if terms is None or start["cost"] - terms["cost"] < MODEL_CORRECT_MIN_GAIN:
@@ -5485,7 +5495,7 @@ def decode_models(meta, parts, count):
             known = spec.get("known_scale")
             unit = spec.get("unit_m")
             unit = 1.0 if unit is None else float(unit)
-            stretch = spec.get("stretch_max")
+            stretch = 1.0 if meta.get("baseline") else spec.get("stretch_max")
             stretch_declared = stretch is not None
             models[index] = ObjectModel(vertices, faces, colours=colours, unit=unit,
                                         stretch_max=MODEL_STRETCH_MAX if stretch is None else float(stretch))
@@ -6381,7 +6391,7 @@ class PoseServer:
         frame's camera, "source": what says so}]), kept to be tried
         (apply_priors()). See MODEL_CHECK_FAILS."""
         self.object_state(len(getattr(self, "models", None) or []))
-        for prior in meta.get("priors") or []:
+        for prior in ([] if BASELINE else meta.get("priors") or []):
             try:
                 index = int(prior["object"])
                 pose = np.asarray(prior["pose"], dtype=np.float64).reshape(4, 4)
@@ -6907,16 +6917,16 @@ class PoseServer:
                         # The box of the mesh less its loose fragments (MODEL_FRAGMENT_GAP).
                         scaled = kept @ np.asarray(result["model_linear"], np.float64).T
                         result["model_bounds"] = [scaled.min(0).tolist(), scaled.max(0).tolist()]
-                    doubt = getattr(model, "fitted_spin_doubt", None)
+                    doubt = None if BASELINE else getattr(model, "fitted_spin_doubt", None)
                     if doubt is not None:
                         # Relative to the fit, so carried by the motion with it.
                         result["model_spin_doubt"] = (np.linalg.inv(held) @ doubt @ held).tolist()
-                    ends = getattr(model, "fitted_ends_doubt", None)
+                    ends = None if BASELINE else getattr(model, "fitted_ends_doubt", None)
                     if ends is not None:
                         result["model_ends_doubt"] = (np.linalg.inv(held) @ ends @ held).tolist()
                     # Every way round in doubt (MODEL_TURN_COST_SLACK), with a
                     # refit's held back (MODEL_REFIT_TURN_DEG).
-                    doubts = list(getattr(model, "fitted_doubts", []))
+                    doubts = [] if BASELINE else list(getattr(model, "fitted_doubts", []))
                     doubts += [d for d in (doubt, ends)
                                if d is not None and not any(np.allclose(d, k) for k in doubts)]
                     if doubts:
@@ -6953,7 +6963,7 @@ class PoseServer:
                     # How far its binding is, and how to tell its ways round (BINDING_CONFIDENCE).
                     bindings = getattr(self, "bindings", None) or []
                     binding = bindings[index] if index < len(bindings) else None
-                    if binding is not None and binding.fit_id == getattr(model, "fitted_id", None):
+                    if not BASELINE and binding is not None and binding.fit_id == getattr(model, "fitted_id", None):
                         result["model_binding"] = binding.reply(held, pose, np.asarray(frame.intrinsics, np.float64),
                                                                 frame.rgb.shape[:2])
                 surfaces = getattr(self, "surfaces", None)
@@ -7164,6 +7174,10 @@ class PoseServer:
         return previews[key]
 
     def init_session(self, meta, parts, started):
+        global BASELINE
+        BASELINE = self.baseline = bool(meta.get("baseline"))
+        if BASELINE:
+            self.say("baseline: unmodified Point2Pose (uniform scale, no correction, doubts, clicks or priors)")
         self.build_pipeline()
         rgb = decode_rgb(parts[0])
         depth = decode_depth(parts[1], meta).astype(np.float32)
@@ -7244,7 +7258,7 @@ class PoseServer:
         # not it. Once only: asked in the init before this one, it is tracked
         # as before (its box, the mesh retried on fresh frames).
         asked = getattr(self, "strays_asked", set())
-        strays = {index: why for index, why in self.init_strays.items() if index not in asked}
+        strays = {} if BASELINE else {index: why for index, why in self.init_strays.items() if index not in asked}
         self.strays_asked = set(strays)
         if strays:
             # Where to click it again, offered: where the mesh came to on its
@@ -7509,6 +7523,10 @@ class PoseServer:
                                  here + [click for click, _ in rivals[index]])
             elif index in kept:
                 unsure[index] = (f"located at scale {scale:.2f}, off the other parts'", here)
+        if unsure and BASELINE:
+            for index, (why, _) in sorted(unsure.items()):
+                self.say(f"object {index}: unsure -- {why}; baseline: its best-fitting place taken")
+            unsure = {}
         if unsure:
             for index, (why, _) in sorted(unsure.items()):
                 self.say(f"object {index}: unsure -- {why}; the person is asked to click it")
@@ -7857,7 +7875,10 @@ class PoseServer:
             # The clicks used, those located by mesh among them, and how.
             **({"points": self.init_points, "init_report": self.init_report,
                 # The parts that kept their fits as last seen (carry_kept_fits()).
-                "kept": sorted(getattr(self, "kept_fits", None) or ())}
+                "kept": sorted(getattr(self, "kept_fits", None) or ()),
+                # Whether this session runs as the unmodified Point2Pose (BASELINE):
+                # a client asking for it stops where a server does not say so.
+                "baseline": BASELINE}
                if cmd == "init" else {}),
         }
         self.last_reply = reply
