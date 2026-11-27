@@ -3926,8 +3926,9 @@ def carried_view(model, mask, metres, K, through=None, anchors=None):
 # The unmodified Point2Pose's behaviour, for the paper's A2 comparison (an init's
 # meta["baseline"]: true): one uniform scale per mesh, no per-frame depth
 # correction (correct_carried_pose() scores the pose as carried), no ways round
-# in doubt or bindings in the reply, no click asked for (the best-fitting place
-# taken), no pose priors. Set by each init; off by default.
+# weighed, turned to or put in the reply (update_bindings()), no click asked
+# for (the best-fitting place taken), no pose priors. Set by each init; off by
+# default.
 BASELINE = False
 
 
@@ -6572,7 +6573,10 @@ class PoseServer:
         `robot`: the robot's pixels, where the part may not be judged at rest.
         `rank`, on the init's view: a way round the ends' silhouettes vote for
         over the published one is published in its place, the other kept in
-        doubt (ENDS_SILHOUETTE_SIGMAS). See BINDING_CONFIDENCE."""
+        doubt (ENDS_SILHOUETTE_SIGMAS). See BINDING_CONFIDENCE.
+        None under BASELINE: the fit's own way round stays published."""
+        if BASELINE:
+            return
         models = getattr(self, "fitted_models", None)
         if not models:
             return
